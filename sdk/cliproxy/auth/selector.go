@@ -1021,6 +1021,32 @@ func isStateBlockedByQuotaOrAuth(unavailable bool, quota QuotaState, nextRetryAf
 	return nextRetryAfter.IsZero() && quota.NextRecoverAt.IsZero()
 }
 
+// shouldPreserveBindingWithPlanQuota layers the fork's plan-quota-first rule on top of upstream's
+// rebind-on=quota behaviour: a transiently unavailable binding is kept, unless the bound auth has
+// exhausted its plan window while other routable auths still have plan quota. In that case the
+// session is rebound so it moves off the exhausted (credits-only) login.
+func (s *SessionAffinitySelector) shouldPreserveBindingWithPlanQuota(ctx context.Context, provider string, candidates, routingAuths []*Auth, model, authID string, now time.Time) bool {
+	if !s.shouldPreserveBindingWhenUnavailable(ctx, candidates, model, authID, now) {
+		return false
+	}
+	var bound *Auth
+	for _, candidate := range candidates {
+		if candidate != nil && candidate.ID == authID {
+			bound = candidate
+			break
+		}
+	}
+	if bound == nil || !authPlanWindowExhausted(provider, bound) {
+		return true
+	}
+	for _, candidate := range routingAuths {
+		if candidate != nil && candidate.ID != authID && !authPlanWindowExhausted(provider, candidate) {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *SessionAffinitySelector) shouldPreserveBindingWhenUnavailable(ctx context.Context, candidates []*Auth, model, authID string, now time.Time) bool {
 	if s == nil || !s.rebindOnQuotaOnly || authID == "" {
 		return false
@@ -1090,9 +1116,15 @@ func (s *SessionAffinitySelector) Trees() *cliproxysession.InMemorySessionTreeSt
 // matcher before retaining the legacy derived/hash fallback behavior.
 //
 // An established binding outranks credential priority: a bound credential that is still
-// available is reused even when a higher-priority credential recovers. Credential priority
-// applies to cold bindings, requests without a session, and genuine bound-credential
-// failover, so the fallback selector only ever receives the highest available priority tier.
+// available is reused even when a higher-priority credential recovers, and a plan-quota
+// binding is not moved just because another plan-quota credential exists. A bound
+// credential whose stored included-plan window is exhausted is treated as unavailable
+// when any other available credential still has plan quota, and the fallback selector
+// rebinds inside that quota subset. A credential that would bill user credits or extra
+// usage is used only when every available credential is plan-exhausted. Credentials with
+// no usage snapshot are not treated as plan-exhausted. Credential priority still applies
+// inside the set passed to the fallback selector, which remains the highest priority tier
+// of that set.
 //
 // Note: The cache key includes provider, session ID, and model to handle cases where
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
@@ -1146,10 +1178,11 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		availabilityCandidates = positiveWeightAuths(auths)
 	}
 	if primaryID == "" {
-		fallbackAuths, errAvailable := getSelectorAvailableAuths(ctx, availabilityCandidates, provider, model, now)
+		availableNow, errAvailable := getSelectorAvailableAuthsAcrossPriorities(ctx, availabilityCandidates, provider, model, now)
 		if errAvailable != nil {
 			return nil, errAvailable
 		}
+		fallbackAuths := highestPriorityAuths(planQuotaRoutingAuths(provider, availableNow))
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
 		return s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 	}
@@ -1160,7 +1193,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if err != nil {
 		return nil, err
 	}
-	fallbackAuths := highestPriorityAuths(available)
+	routingAuths := planQuotaRoutingAuths(provider, available)
+	fallbackAuths := highestPriorityAuths(routingAuths)
+	stickyQuotaOK := authIDSet(routingAuths)
 
 	modelKey := canonicalModelKey(model)
 	cacheKey := provider + "::" + primaryID + "::" + modelKey
@@ -1175,18 +1210,27 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if fallbackID != "" && fallbackID != primaryID {
 		fallbackKey = provider + "::" + fallbackID + "::" + modelKey
 	}
-	bind := func(authID string) {
+	bindID := func(authID string) {
+		if authID == "" {
+			return
+		}
 		if fallbackKey != "" && !isSubagent && !isFork {
 			s.cache.SetAliases(authID, cacheKey, fallbackKey)
 		} else {
 			s.cache.Set(cacheKey, authID)
 		}
 	}
+	bind := func(auth *Auth) {
+		if auth == nil {
+			return
+		}
+		bindID(auth.ID)
+	}
 
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
 		for _, auth := range available {
-			if auth.ID == cachedAuthID {
-				bind(auth.ID)
+			if auth != nil && auth.ID == cachedAuthID && stickyQuotaOK[auth.ID] {
+				bind(auth)
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
 			}
@@ -1199,12 +1243,12 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		if auth == nil {
 			return nil, nil
 		}
-		if s.shouldPreserveBindingWhenUnavailable(ctx, availabilityCandidates, model, cachedAuthID, now) {
-			bind(cachedAuthID)
+		if s.shouldPreserveBindingWithPlanQuota(ctx, provider, availabilityCandidates, routingAuths, model, cachedAuthID, now) {
+			bindID(cachedAuthID)
 			entry.Infof("session-affinity: cache hit but auth transiently unavailable, failover without rebinding | session=%s bound_auth=%s failover_auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, auth.ID, provider, model)
 			return auth, nil
 		}
-		bind(auth.ID)
+		bind(auth)
 		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		return auth, nil
 	}
@@ -1212,9 +1256,9 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if fallbackKey != "" {
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
 			for _, auth := range available {
-				if auth.ID == cachedAuthID {
+				if auth != nil && auth.ID == cachedAuthID && stickyQuotaOK[auth.ID] {
 					if !isSubagent || s.subagentAffinity {
-						bind(auth.ID)
+						bind(auth)
 						if isFork {
 							entry.Infof("session-affinity: fork cache hit | session=%s parent=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 						} else {
@@ -1224,7 +1268,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 					}
 				}
 			}
-			if !isSubagent && !isFork && s.shouldPreserveBindingWhenUnavailable(ctx, availabilityCandidates, model, cachedAuthID, now) {
+			if !isSubagent && !isFork && s.shouldPreserveBindingWithPlanQuota(ctx, provider, availabilityCandidates, routingAuths, model, cachedAuthID, now) {
 				auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 				if err != nil {
 					return nil, err
@@ -1232,7 +1276,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				if auth == nil {
 					return nil, nil
 				}
-				bind(cachedAuthID)
+				bindID(cachedAuthID)
 				entry.Infof("session-affinity: fallback cache hit but auth transiently unavailable, failover without rebinding | session=%s fallback=%s bound_auth=%s failover_auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), cachedAuthID, auth.ID, provider, model)
 				return auth, nil
 			}
@@ -1246,7 +1290,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if auth == nil {
 		return nil, nil
 	}
-	bind(auth.ID)
+	bind(auth)
 	if isFork && fallbackID != "" {
 		entry.Infof("session-affinity: fork bound to new auth | session=%s parent=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 	} else {
@@ -1287,11 +1331,13 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 	if errAvailable != nil {
 		return nil, true, errAvailable
 	}
+	routingAuths := planQuotaRoutingAuths(provider, available)
+	stickyQuotaOK := authIDSet(routingAuths)
 
 	var preservedAuthID string
 	if match, ok := s.matcher.MatchFingerprintsWithContext(namespace, fingerprints, tailFingerprints, envDigest, minPrefixLength); ok {
 		for _, auth := range available {
-			if auth == nil || auth.ID != match.AuthID {
+			if auth == nil || auth.ID != match.AuthID || !stickyQuotaOK[auth.ID] {
 				continue
 			}
 			if match.SessionID != "" {
@@ -1330,12 +1376,12 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 			}
 			return auth, true, nil
 		}
-		if !match.IsFork && s.shouldPreserveBindingWhenUnavailable(ctx, availabilityCandidates, model, match.AuthID, now) {
+		if !match.IsFork && s.shouldPreserveBindingWithPlanQuota(ctx, provider, availabilityCandidates, routingAuths, model, match.AuthID, now) {
 			preservedAuthID = match.AuthID
 		}
 	}
 
-	fallbackAuths := highestPriorityAuths(available)
+	fallbackAuths := highestPriorityAuths(routingAuths)
 	auth, errPick := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 	if errPick != nil {
 		return nil, true, errPick
