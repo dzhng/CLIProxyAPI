@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -711,6 +712,22 @@ func (s *WeightedRoundRobinSelector) Pick(ctx context.Context, provider, model s
 // transient subsets produced by retry exclusions and cooldowns are never pruned.
 const maxSmoothWeightedStateEntries = 1024
 
+// syncWeights records the current weight vector without clearing accumulated
+// credits. Plan-reset weights drift as deadlines approach; wiping credits on
+// every small change would collapse the rotation onto the soonest reset.
+func (s *smoothWeightedState) syncWeights(weights map[string]int64) {
+	if s.current == nil {
+		s.current = make(map[string]int64, len(weights))
+	}
+	if s.weights == nil {
+		s.weights = make(map[string]int64, len(weights))
+	}
+	for authID, weight := range weights {
+		s.weights[authID] = weight
+	}
+	s.pruneStale(weights)
+}
+
 // prepare syncs the configured weights into the state without discarding accumulated
 // credits. Credits are reset only when a credential's configured weight actually changes,
 // never when the candidate set shrinks temporarily (retry exclusions, cooldowns, session
@@ -776,12 +793,28 @@ func authWeightVector(auths []*Auth) map[string]int64 {
 }
 
 func pickSmoothWeightedAuth(auths []*Auth, current map[string]int64) *Auth {
+	weights := make(map[string]int64, len(auths))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		if weight := authWeight(auth); weight > 0 {
+			weights[auth.ID] = weight
+		}
+	}
+	return pickSmoothWeightedByWeight(auths, current, weights)
+}
+
+func pickSmoothWeightedByWeight(auths []*Auth, current map[string]int64, weights map[string]int64) *Auth {
 	var picked *Auth
 	var pickedCurrent int64
 	var totalWeight int64
 	for _, auth := range auths {
-		weight := authWeight(auth)
-		if auth == nil || weight <= 0 {
+		if auth == nil {
+			continue
+		}
+		weight := weights[auth.ID]
+		if weight <= 0 {
 			continue
 		}
 		current[auth.ID] = saturatingAddInt64(current[auth.ID], weight)
@@ -914,6 +947,11 @@ type SessionAffinitySelector struct {
 	cache            *SessionCache
 	matcher          *cliproxysession.MerklePrefixMatcher
 	subagentAffinity bool
+	// lastActivityUnix is the last Pick, in Unix nanoseconds. Zero means this
+	// selector has not seen a request. It is not a binding table.
+	lastActivityUnix atomic.Int64
+	planResetMu      sync.Mutex
+	planResetStates  map[string]*smoothWeightedState
 }
 
 // SessionAffinityConfig configures the session affinity selector.
@@ -966,17 +1004,19 @@ func (s *SessionAffinitySelector) Trees() *cliproxysession.InMemorySessionTreeSt
 // available is reused even when a higher-priority credential recovers, and a plan-quota
 // binding is not moved just because another plan-quota credential exists. A bound
 // credential whose stored included-plan window is exhausted is treated as unavailable
-// when any other available credential still has plan quota, and the fallback selector
-// rebinds inside that quota subset. A credential that would bill user credits or extra
-// usage is used only when every available credential is plan-exhausted. Credentials with
-// no usage snapshot are not treated as plan-exhausted. Credential priority still applies
-// inside the set passed to the fallback selector, which remains the highest priority tier
-// of that set.
+// when any other available credential still has plan quota, and is rebound inside that
+// quota subset. New sessions and rebinds inside the quota subset use reset-weighted
+// round-robin (sooner plan reset, higher weight), except that a new session picked
+// after an hour with no requests takes the soonest reset directly. When every
+// credential is plan-exhausted the configured fallback selector still runs on the full
+// set. Credentials with no usage snapshot are not treated as plan-exhausted. Credential
+// priority still applies inside the quota subset.
 //
 // Note: The cache key includes provider, session ID, and model to handle cases where
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
 // that may be supported by different auth credentials, and to avoid cross-provider conflicts.
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	wasIdle := s.noteRequestActivity(time.Now())
 	entry := selectorLogEntry(ctx)
 	if opts.Metadata == nil {
 		opts.Metadata = make(map[string]any)
@@ -988,7 +1028,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	// consulted when no header, body, or execution-session identity is present.
 	explicitID, explicitFallbackID := extractExplicitSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	if explicitID == "" {
-		if auth, handled, errLCP := s.pickLCP(ctx, provider, model, opts, auths, entry); handled || errLCP != nil {
+		if auth, handled, errLCP := s.pickLCP(ctx, provider, model, opts, auths, entry, wasIdle); handled || errLCP != nil {
 			return auth, errLCP
 		}
 	} else if opts.Metadata != nil {
@@ -1029,9 +1069,8 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		if errAvailable != nil {
 			return nil, errAvailable
 		}
-		fallbackAuths := highestPriorityAuths(planQuotaRoutingAuths(provider, availableNow))
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		return s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+		return s.pickPlanQuota(ctx, provider, model, opts, availableNow, true, wasIdle)
 	}
 
 	// A single availability pass serves both lookups: the bound credential is validated against
@@ -1041,7 +1080,6 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return nil, err
 	}
 	routingAuths := planQuotaRoutingAuths(provider, available)
-	fallbackAuths := highestPriorityAuths(routingAuths)
 	stickyQuotaOK := authIDSet(routingAuths)
 
 	modelKey := canonicalModelKey(model)
@@ -1076,8 +1114,8 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				return auth, nil
 			}
 		}
-		// Cached auth not available, reselect via fallback selector for even distribution
-		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+		// Cached auth not available or plan-exhausted; rebind inside the quota set.
+		auth, err := s.pickPlanQuota(ctx, provider, model, opts, available, false, wasIdle)
 		if err != nil {
 			return nil, err
 		}
@@ -1107,7 +1145,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+	auth, err := s.pickPlanQuota(ctx, provider, model, opts, available, true, wasIdle)
 	if err != nil {
 		return nil, err
 	}
@@ -1123,7 +1161,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	return auth, nil
 }
 
-func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth, entry *log.Entry) (*Auth, bool, error) {
+func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth, entry *log.Entry, wasIdle bool) (*Auth, bool, error) {
 	if s == nil || s.matcher == nil {
 		return nil, false, nil
 	}
@@ -1200,8 +1238,7 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 		}
 	}
 
-	fallbackAuths := highestPriorityAuths(routingAuths)
-	auth, errPick := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+	auth, errPick := s.pickPlanQuota(ctx, provider, model, opts, available, true, wasIdle)
 	if errPick != nil {
 		return nil, true, errPick
 	}
@@ -1243,6 +1280,80 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 		}
 	}
 	return auth, true, nil
+}
+
+// noteRequestActivity records this Pick and reports whether the previous
+// request, if any, was more than an hour ago.
+func (s *SessionAffinitySelector) noteRequestActivity(now time.Time) bool {
+	if s == nil {
+		return true
+	}
+	previous := s.lastActivityUnix.Swap(now.UnixNano())
+	if previous == 0 {
+		return true
+	}
+	return now.Sub(time.Unix(0, previous)) > planQuotaIdleWindow
+}
+
+// pickPlanQuota selects inside the plan-quota subset. New sessions after an
+// hour of silence take the soonest reset. Otherwise new sessions and rebinds
+// use reset-weighted round-robin. A fully plan-exhausted set keeps the
+// configured fallback selector.
+func (s *SessionAffinitySelector) pickPlanQuota(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, available []*Auth, newSession, wasIdle bool) (*Auth, error) {
+	if !planResetRoutingActive(provider, available) || !builtInRoutingSelector(s.fallback) {
+		return s.fallback.Pick(ctx, provider, model, opts, highestPriorityAuths(planQuotaRoutingAuths(provider, available)))
+	}
+	candidates := highestPriorityAuths(planQuotaRoutingAuths(provider, available))
+	if newSession && wasIdle {
+		if picked := pickSoonestPlanReset(provider, candidates, time.Now()); picked != nil {
+			return picked, nil
+		}
+	}
+	return s.pickPlanResetWeighted(provider, model, candidates)
+}
+
+func builtInRoutingSelector(selector Selector) bool {
+	switch selector.(type) {
+	case *RoundRobinSelector, *FillFirstSelector, *WeightedRoundRobinSelector:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *SessionAffinitySelector) pickPlanResetWeighted(provider, model string, auths []*Auth) (*Auth, error) {
+	if len(auths) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
+	}
+	now := time.Now()
+	weights := make(map[string]int64, len(auths))
+	for _, candidate := range auths {
+		if candidate == nil || candidate.ID == "" {
+			continue
+		}
+		weights[candidate.ID] = planResetRoutingWeight(provider, candidate, now)
+	}
+	key := provider + ":" + canonicalModelKey(model)
+
+	s.planResetMu.Lock()
+	defer s.planResetMu.Unlock()
+	if s.planResetStates == nil {
+		s.planResetStates = make(map[string]*smoothWeightedState)
+	}
+	if _, ok := s.planResetStates[key]; !ok && len(s.planResetStates) >= 4096 {
+		s.planResetStates = make(map[string]*smoothWeightedState)
+	}
+	state := s.planResetStates[key]
+	if state == nil {
+		state = &smoothWeightedState{}
+		s.planResetStates[key] = state
+	}
+	state.syncWeights(weights)
+	picked := pickSmoothWeightedByWeight(auths, state.current, weights)
+	if picked == nil {
+		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+	}
+	return picked, nil
 }
 
 func canonicalLCPProvider(provider string) string {
