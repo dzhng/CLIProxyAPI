@@ -4,6 +4,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const codexWeeklyPlanWindowMinutes = 10080
@@ -186,4 +187,173 @@ func quotaSignal(signals map[string]string, name string) string {
 		}
 	}
 	return ""
+}
+
+const (
+	// planResetWeightFloor keeps a later-reset credential in the rotation.
+	planResetWeightFloor int64 = 1
+	// planResetWeightScale is one day in seconds. See planResetRoutingWeight.
+	planResetWeightScale int64 = 24 * 60 * 60
+)
+
+// planQuotaIdleWindow is how long the proxy must see no requests before the
+// next new session is pinned to the soonest plan reset instead of weighted
+// round-robin.
+const planQuotaIdleWindow = time.Hour
+
+// planResetRoutingWeight is the smooth weighted-round-robin weight for a
+// credential that still has plan quota.
+//
+//	weight = 1 + 86400 / max(secondsUntilReset, 1)
+//
+// A sooner reset produces a higher weight. The leading 1 is a floor so a
+// later reset still receives some new sessions. A missing reset uses that
+// floor alone and is not given an invented deadline, so it never outranks a
+// known reset. A known reset further than 86400 seconds away ties the floor.
+func planResetRoutingWeight(provider string, auth *Auth, now time.Time) int64 {
+	deadline, ok := planResetDeadline(provider, auth, now)
+	if !ok {
+		return planResetWeightFloor
+	}
+	seconds := int64(deadline.Sub(now) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	return planResetWeightFloor + planResetWeightScale/seconds
+}
+
+// planResetDeadline is the relevant included-plan reset: Codex primary, or the
+// sooner of the Claude 5h and 7d resets. A missing field is not a deadline.
+func planResetDeadline(provider string, auth *Auth, now time.Time) (time.Time, bool) {
+	if auth == nil {
+		return time.Time{}, false
+	}
+	switch planQuotaProviderKind(provider, auth) {
+	case "codex":
+		return codexPrimaryReset(auth, now)
+	case "claude":
+		return claudeSoonerPlanReset(auth)
+	default:
+		return time.Time{}, false
+	}
+}
+
+func codexPrimaryReset(auth *Auth, now time.Time) (time.Time, bool) {
+	signals := auth.Quota.Signals
+	if raw := quotaSignal(signals, "X-Codex-Primary-Reset-At"); raw != "" {
+		if deadline, ok := parseResetTimestamp(raw); ok {
+			return deadline, true
+		}
+	}
+	raw := quotaSignal(signals, "X-Codex-Primary-Reset-After-Seconds")
+	if raw == "" {
+		return time.Time{}, false
+	}
+	seconds, errParse := strconv.ParseFloat(raw, 64)
+	if errParse != nil || math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds < 0 {
+		return time.Time{}, false
+	}
+	base := auth.Quota.ObservedAt
+	if base.IsZero() {
+		base = now
+	}
+	return base.Add(time.Duration(seconds * float64(time.Second))), true
+}
+
+func claudeSoonerPlanReset(auth *Auth) (time.Time, bool) {
+	var sooner time.Time
+	found := false
+	for _, name := range []string{
+		"Anthropic-Ratelimit-Unified-5h-Reset",
+		"Anthropic-Ratelimit-Unified-7d-Reset",
+	} {
+		raw := quotaSignal(auth.Quota.Signals, name)
+		if raw == "" {
+			continue
+		}
+		deadline, ok := parseResetTimestamp(raw)
+		if !ok {
+			continue
+		}
+		if !found || deadline.Before(sooner) {
+			sooner = deadline
+			found = true
+		}
+	}
+	return sooner, found
+}
+
+func parseResetTimestamp(raw string) (time.Time, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, false
+	}
+	if seconds, errParse := strconv.ParseFloat(raw, 64); errParse == nil && seconds > 0 && !math.IsNaN(seconds) && !math.IsInf(seconds, 0) {
+		whole := int64(seconds)
+		if whole > 0 {
+			fraction := int64((seconds - float64(whole)) * float64(time.Second))
+			return time.Unix(whole, fraction), true
+		}
+	}
+	if deadline, errParse := time.Parse(time.RFC3339, raw); errParse == nil {
+		return deadline, true
+	}
+	return time.Time{}, false
+}
+
+// planResetRoutingActive reports whether new sessions in this set use reset
+// weighting. It stays off for providers without a plan window, and when every
+// Codex or Claude credential is already plan-exhausted.
+func planResetRoutingActive(provider string, auths []*Auth) bool {
+	if len(auths) == 0 || planQuotaRoutingFellBack(provider, auths) {
+		return false
+	}
+	saw := false
+	for _, candidate := range auths {
+		if candidate == nil {
+			continue
+		}
+		saw = true
+		if planQuotaProviderKind(provider, candidate) == "" {
+			return false
+		}
+	}
+	return saw
+}
+
+// planQuotaRoutingFellBack reports that every credential is plan-exhausted, so
+// the caller must keep the ordinary selector instead of reset weighting.
+func planQuotaRoutingFellBack(provider string, auths []*Auth) bool {
+	saw := false
+	for _, candidate := range auths {
+		if candidate == nil {
+			continue
+		}
+		saw = true
+		if !authPlanWindowExhausted(provider, candidate) {
+			return false
+		}
+	}
+	return saw
+}
+
+// pickSoonestPlanReset returns the credential whose relevant plan window resets
+// first. Credentials with no reset are skipped. Equal deadlines keep input order.
+func pickSoonestPlanReset(provider string, auths []*Auth, now time.Time) *Auth {
+	var picked *Auth
+	var soonest time.Time
+	for _, candidate := range auths {
+		if candidate == nil {
+			continue
+		}
+		deadline, ok := planResetDeadline(provider, candidate, now)
+		if !ok {
+			continue
+		}
+		if picked == nil || deadline.Before(soonest) {
+			picked = candidate
+			soonest = deadline
+		}
+	}
+	return picked
 }
