@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -948,12 +947,9 @@ type SessionAffinitySelector struct {
 	matcher           *cliproxysession.MerklePrefixMatcher
 	subagentAffinity  bool
 	rebindOnQuotaOnly bool
-	// lastActivityUnix is the last Pick, in Unix nanoseconds. Zero means this
-	// selector has not seen a request. It is not a binding table.
-	lastActivityUnix atomic.Int64
-	planResetMu      sync.Mutex
-	planResetStates  map[string]*smoothWeightedState
-	planResetLogSigs map[string]string
+	planResetMu       sync.Mutex
+	planResetStates   map[string]*smoothWeightedState
+	planResetLogSigs  map[string]string
 }
 
 const (
@@ -1160,8 +1156,8 @@ func (s *SessionAffinitySelector) Trees() *cliproxysession.InMemorySessionTreeSt
 // credential whose stored included-plan window is exhausted is treated as unavailable
 // when any other available credential still has plan quota, and is rebound inside that
 // quota subset. New sessions and rebinds inside the quota subset use reset-weighted
-// round-robin (sooner plan reset, higher weight), except that a new session picked
-// after an hour with no requests takes the soonest reset directly. When every
+// round-robin (sooner plan reset, higher weight, times the Codex manual-reset boost),
+// with no special case after idle periods. When every
 // credential is plan-exhausted the configured fallback selector still runs on the full
 // set. Credentials with no usage snapshot are not treated as plan-exhausted. Credential
 // priority still applies inside the quota subset.
@@ -1170,7 +1166,6 @@ func (s *SessionAffinitySelector) Trees() *cliproxysession.InMemorySessionTreeSt
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
 // that may be supported by different auth credentials, and to avoid cross-provider conflicts.
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	wasIdle := s.noteRequestActivity(time.Now())
 	entry := selectorLogEntry(ctx)
 	if opts.Metadata == nil {
 		opts.Metadata = make(map[string]any)
@@ -1182,7 +1177,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	// consulted when no header, body, or execution-session identity is present.
 	explicitID, explicitFallbackID := extractExplicitSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	if explicitID == "" {
-		if auth, handled, errLCP := s.pickLCP(ctx, provider, model, opts, auths, entry, wasIdle); handled || errLCP != nil {
+		if auth, handled, errLCP := s.pickLCP(ctx, provider, model, opts, auths, entry); handled || errLCP != nil {
 			return auth, errLCP
 		}
 	} else if opts.Metadata != nil {
@@ -1224,7 +1219,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			return nil, errAvailable
 		}
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		return s.pickPlanQuota(ctx, provider, model, opts, availableNow, true, wasIdle)
+		return s.pickPlanQuota(ctx, provider, model, opts, availableNow)
 	}
 
 	// A single availability pass serves both lookups: the bound credential is validated against
@@ -1275,7 +1270,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			}
 		}
 		// Cached auth not available or plan-exhausted; rebind inside the quota set.
-		auth, err := s.pickPlanQuota(ctx, provider, model, opts, available, false, wasIdle)
+		auth, err := s.pickPlanQuota(ctx, provider, model, opts, available)
 		if err != nil {
 			return nil, err
 		}
@@ -1308,7 +1303,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				}
 			}
 			if !isSubagent && !isFork && s.shouldPreserveBindingWithPlanQuota(ctx, provider, availabilityCandidates, routingAuths, model, cachedAuthID, now) {
-				auth, err := s.pickPlanQuota(ctx, provider, model, opts, available, false, wasIdle)
+				auth, err := s.pickPlanQuota(ctx, provider, model, opts, available)
 				if err != nil {
 					return nil, err
 				}
@@ -1322,7 +1317,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
-	auth, err := s.pickPlanQuota(ctx, provider, model, opts, available, true, wasIdle)
+	auth, err := s.pickPlanQuota(ctx, provider, model, opts, available)
 	if err != nil {
 		return nil, err
 	}
@@ -1338,7 +1333,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	return auth, nil
 }
 
-func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth, entry *log.Entry, wasIdle bool) (*Auth, bool, error) {
+func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth, entry *log.Entry) (*Auth, bool, error) {
 	if s == nil || s.matcher == nil {
 		return nil, false, nil
 	}
@@ -1420,7 +1415,7 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 		}
 	}
 
-	auth, errPick := s.pickPlanQuota(ctx, provider, model, opts, available, true, wasIdle)
+	auth, errPick := s.pickPlanQuota(ctx, provider, model, opts, available)
 	if errPick != nil {
 		return nil, true, errPick
 	}
@@ -1481,33 +1476,15 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 	return auth, true, nil
 }
 
-// noteRequestActivity records this Pick and reports whether the previous
-// request, if any, was more than an hour ago.
-func (s *SessionAffinitySelector) noteRequestActivity(now time.Time) bool {
-	if s == nil {
-		return true
-	}
-	previous := s.lastActivityUnix.Swap(now.UnixNano())
-	if previous == 0 {
-		return true
-	}
-	return now.Sub(time.Unix(0, previous)) > planQuotaIdleWindow
-}
-
-// pickPlanQuota selects inside the plan-quota subset. New sessions after an
-// hour of silence take the soonest reset. Otherwise new sessions and rebinds
-// use reset-weighted round-robin. A fully plan-exhausted set keeps the
+// pickPlanQuota selects inside the plan-quota subset. New sessions and rebinds
+// always use reset-weighted round-robin (with the manual-reset boost), whether
+// or not the proxy has been idle. A fully plan-exhausted set keeps the
 // configured fallback selector.
-func (s *SessionAffinitySelector) pickPlanQuota(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, available []*Auth, newSession, wasIdle bool) (*Auth, error) {
+func (s *SessionAffinitySelector) pickPlanQuota(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, available []*Auth) (*Auth, error) {
 	if !planResetRoutingActive(provider, available) || !builtInRoutingSelector(s.fallback) {
 		return s.fallback.Pick(ctx, provider, model, opts, highestPriorityAuths(planQuotaRoutingAuths(provider, available)))
 	}
 	candidates := highestPriorityAuths(planQuotaRoutingAuths(provider, available))
-	if newSession && wasIdle {
-		if picked := pickSoonestPlanReset(provider, candidates, time.Now()); picked != nil {
-			return picked, nil
-		}
-	}
 	return s.pickPlanResetWeighted(provider, model, candidates)
 }
 
