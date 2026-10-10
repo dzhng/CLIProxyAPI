@@ -418,6 +418,20 @@ type RoutingConfig struct {
 	//     auth errors (429, 401/402/403, 404/model support, invalid_grant) rebind as normal.
 	// Ignored when SessionAffinity is false.
 	SessionAffinityRebindOn string `yaml:"session-affinity-rebind-on,omitempty" json:"session-affinity-rebind-on,omitempty"`
+
+	// ManualResetPriority boosts the Codex credential whose banked manual reset
+	// (rate-limit reset credit) expires soonest, when the candidates' weekly
+	// plan windows reset within ManualResetBand of each other. Only applies to
+	// plan-quota routing (session-affinity). Default: true.
+	ManualResetPriority *bool `yaml:"manual-reset-priority,omitempty" json:"manual-reset-priority,omitempty"`
+
+	// ManualResetBand is how close the weekly resets must be for the manual
+	// reset priority to apply. Default: 24h.
+	ManualResetBand string `yaml:"manual-reset-band,omitempty" json:"manual-reset-band,omitempty"`
+
+	// ManualResetBoost multiplies the routing weight of the soonest-expiring
+	// manual reset. Default: 8 (about 67% of new sessions across 5 equal accounts).
+	ManualResetBoost int `yaml:"manual-reset-boost,omitempty" json:"manual-reset-boost,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
