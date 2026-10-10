@@ -196,11 +196,6 @@ const (
 	planResetWeightScale int64 = 24 * 60 * 60
 )
 
-// planQuotaIdleWindow is how long the proxy must see no requests before the
-// next new session is pinned to the soonest plan reset instead of weighted
-// round-robin.
-const planQuotaIdleWindow = time.Hour
-
 // planResetRoutingWeight is the smooth weighted-round-robin weight for a
 // credential that still has plan quota.
 //
@@ -335,25 +330,4 @@ func planQuotaRoutingFellBack(provider string, auths []*Auth) bool {
 		}
 	}
 	return saw
-}
-
-// pickSoonestPlanReset returns the credential whose relevant plan window resets
-// first. Credentials with no reset are skipped. Equal deadlines keep input order.
-func pickSoonestPlanReset(provider string, auths []*Auth, now time.Time) *Auth {
-	var picked *Auth
-	var soonest time.Time
-	for _, candidate := range auths {
-		if candidate == nil {
-			continue
-		}
-		deadline, ok := planResetDeadline(provider, candidate, now)
-		if !ok {
-			continue
-		}
-		if picked == nil || deadline.Before(soonest) {
-			picked = candidate
-			soonest = deadline
-		}
-	}
-	return picked
 }

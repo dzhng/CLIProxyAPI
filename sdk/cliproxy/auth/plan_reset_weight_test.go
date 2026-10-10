@@ -63,14 +63,14 @@ func TestPlanResetDeadlineUsesCodexPrimaryAndSoonerClaudeWindow(t *testing.T) {
 	}
 }
 
-func TestPlanQuotaNewSessionIdlePicksSoonestResetNotFillFirst(t *testing.T) {
+func TestPlanQuotaFirstNewSessionIsWeightedNotFillFirst(t *testing.T) {
 	t.Parallel()
 	selector := NewSessionAffinitySelector(&FillFirstSelector{})
 	defer selector.Stop()
 	now := time.Now()
 	later := withCodexResetAt("auth-a", now.Add(24*time.Hour))
 	soon := withCodexResetAt("auth-z", now.Add(time.Hour))
-	got, errPick := selector.Pick(context.Background(), "codex", "gpt-5", sessionPickOpts("idle-new"), []*Auth{later, soon})
+	got, errPick := selector.Pick(context.Background(), "codex", "gpt-5", sessionPickOpts("first-new"), []*Auth{later, soon})
 	if errPick != nil {
 		t.Fatalf("Pick() error = %v", errPick)
 	}
@@ -97,35 +97,6 @@ func TestPlanQuotaWeightedSpreadAfterRecentActivity(t *testing.T) {
 	}
 	if counts[soon.ID] <= counts[later.ID] || counts[later.ID] == 0 {
 		t.Fatalf("counts = %#v, want soonest %s to lead while %s still receives picks", counts, soon.ID, later.ID)
-	}
-}
-
-func TestPlanQuotaIdleHourPicksSoonestAgain(t *testing.T) {
-	t.Parallel()
-	selector := NewSessionAffinitySelector(&FillFirstSelector{})
-	defer selector.Stop()
-	now := time.Now()
-	soon := withCodexResetAt("auth-a", now.Add(12*time.Hour))
-	later := withCodexResetAt("auth-b", now.Add(24*time.Hour))
-	auths := []*Auth{soon, later}
-	var last string
-	for i := 0; i < 4; i++ {
-		got, errPick := selector.Pick(context.Background(), "codex", "gpt-5", sessionPickOpts("warm-"+strconv.Itoa(i)), auths)
-		if errPick != nil {
-			t.Fatalf("Pick(%d) error = %v", i, errPick)
-		}
-		last = got.ID
-	}
-	if last != soon.ID {
-		t.Fatalf("4th new session = %s, want %s before forcing idle", last, soon.ID)
-	}
-	selector.lastActivityUnix.Store(time.Now().Add(-2 * time.Hour).UnixNano())
-	got, errPick := selector.Pick(context.Background(), "codex", "gpt-5", sessionPickOpts("after-idle"), auths)
-	if errPick != nil {
-		t.Fatalf("idle Pick() error = %v", errPick)
-	}
-	if got == nil || got.ID != soon.ID {
-		t.Fatalf("idle Pick() = %v, want soonest %s (weighted next pick would be %s)", got, soon.ID, later.ID)
 	}
 }
 

@@ -73,7 +73,6 @@ func TestManualResetPriorityBoostsSoonestExpiryWithinBand(t *testing.T) {
 
 	selector := NewSessionAffinitySelector(&RoundRobinSelector{})
 	defer selector.Stop()
-	selector.lastActivityUnix.Store(time.Now().UnixNano())
 	counts := map[string]int{}
 	for i := 0; i < 55; i++ {
 		got, err := selector.Pick(context.Background(), "codex", "gpt-6-sol", sessionPickOpts("band-"+strconv.Itoa(i)), auths)
@@ -183,7 +182,6 @@ func TestManualResetPrioritySkipsPlanExhaustedCredential(t *testing.T) {
 	// Through the selector the exhausted account never receives a new session.
 	selector := NewSessionAffinitySelector(&RoundRobinSelector{})
 	defer selector.Stop()
-	selector.lastActivityUnix.Store(time.Now().UnixNano())
 	for i := 0; i < 20; i++ {
 		got, err := selector.Pick(context.Background(), "codex", "gpt-6-sol", sessionPickOpts("exh-"+strconv.Itoa(i)), auths)
 		if err != nil {
@@ -229,5 +227,39 @@ func TestShortAuthLabelNeverLeaksEmail(t *testing.T) {
 	other := ShortAuthLabel(&Auth{ID: "someone@example.com"})
 	if other == "" || other == "someone@example.com" || len(other) > 16 {
 		t.Fatalf("fallback label = %q", other)
+	}
+}
+
+// A new session on a fresh (formerly "idle") selector goes through the same
+// weighted pick as any other new session, so the manual-reset boost applies
+// instead of a soonest-weekly-reset shortcut.
+func TestManualResetPriorityAppliesToFirstNewSessionAfterIdle(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	soonestWeekly := withCodexResetAt("mr-idle-a", now.Add(12*time.Hour)) // weight 3
+	boosted := withCodexResetAt("mr-idle-b", now.Add(24*time.Hour))       // weight 2 x 8 = 16
+	forgetAll(t, soonestWeekly, boosted)
+	SetCodexManualResetExpiries(boosted.ID, []time.Time{now.Add(10 * 24 * time.Hour)}, now)
+	auths := []*Auth{soonestWeekly, boosted}
+
+	selector := NewSessionAffinitySelector(&FillFirstSelector{})
+	defer selector.Stop()
+	got, err := selector.Pick(context.Background(), "codex", "gpt-6-sol", sessionPickOpts("idle-first"), auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != boosted.ID {
+		t.Fatalf("first new session = %v, want boosted %s (not soonest weekly %s)", got, boosted.ID, soonestWeekly.ID)
+	}
+	counts := map[string]int{got.ID: 1}
+	for i := 0; i < 18; i++ {
+		next, errPick := selector.Pick(context.Background(), "codex", "gpt-6-sol", sessionPickOpts("idle-next-"+strconv.Itoa(i)), auths)
+		if errPick != nil {
+			t.Fatalf("Pick(%d) error = %v", i, errPick)
+		}
+		counts[next.ID]++
+	}
+	if counts[boosted.ID] != 16 || counts[soonestWeekly.ID] != 3 {
+		t.Fatalf("counts = %v, want 16/3 from weights 16 and 3", counts)
 	}
 }
