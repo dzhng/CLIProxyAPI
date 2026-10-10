@@ -232,11 +232,32 @@ func (h *Handler) APICall(c *gin.Context) {
 		return
 	}
 
+	recordCodexManualResetSnapshot(method, parsedURL, auth, resp.StatusCode, respBody)
+
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
 		Header:     resp.Header,
 		Body:       string(respBody),
 	})
+}
+
+// recordCodexManualResetSnapshot reuses the console's read of a Codex
+// credential's banked manual resets for manual-reset priority routing. Only a
+// successful GET of the listing endpoint is recorded; the consume endpoint is
+// never matched.
+func recordCodexManualResetSnapshot(method string, parsedURL *url.URL, auth *coreauth.Auth, status int, body []byte) {
+	if auth == nil || parsedURL == nil || method != http.MethodGet || status < 200 || status >= 300 {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return
+	}
+	if !strings.EqualFold(parsedURL.Hostname(), "chatgpt.com") || strings.TrimRight(parsedURL.Path, "/") != "/backend-api/wham/rate-limit-reset-credits" {
+		return
+	}
+	if _, errRecord := coreauth.RecordCodexManualResetCredits(auth.ID, body, time.Now()); errRecord != nil {
+		log.Debugf("management APICall: ignored manual reset snapshot | auth=%s err=%v", coreauth.ShortAuthLabel(auth), errRecord)
+	}
 }
 
 func firstNonEmptyString(values ...*string) string {

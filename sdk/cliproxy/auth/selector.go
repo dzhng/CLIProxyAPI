@@ -952,6 +952,7 @@ type SessionAffinitySelector struct {
 	lastActivityUnix atomic.Int64
 	planResetMu      sync.Mutex
 	planResetStates  map[string]*smoothWeightedState
+	planResetLogSigs map[string]string
 }
 
 // SessionAffinityConfig configures the session affinity selector.
@@ -1333,6 +1334,7 @@ func (s *SessionAffinitySelector) pickPlanResetWeighted(provider, model string, 
 		}
 		weights[candidate.ID] = planResetRoutingWeight(provider, candidate, now)
 	}
+	boosted := applyManualResetPriority(provider, auths, weights, now, currentManualResetSettings())
 	key := provider + ":" + canonicalModelKey(model)
 
 	s.planResetMu.Lock()
@@ -1348,12 +1350,61 @@ func (s *SessionAffinitySelector) pickPlanResetWeighted(provider, model string, 
 		state = &smoothWeightedState{}
 		s.planResetStates[key] = state
 	}
+	s.logPlanResetWeightsLocked(provider, key, auths, weights, boosted, now)
 	state.syncWeights(weights)
 	picked := pickSmoothWeightedByWeight(auths, state.current, weights)
 	if picked == nil {
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 	}
 	return picked, nil
+}
+
+// logPlanResetWeightsLocked logs the Codex plan-reset weight table whenever it
+// changes for a provider/model key. Labels are short file ids; emails and
+// tokens are never logged. Callers must hold planResetMu.
+func (s *SessionAffinitySelector) logPlanResetWeightsLocked(provider, key string, auths []*Auth, weights map[string]int64, boosted map[string]bool, now time.Time) {
+	if s == nil || len(auths) == 0 {
+		return
+	}
+	parts := make([]string, 0, len(auths))
+	codex := false
+	for _, candidate := range auths {
+		if candidate == nil || candidate.ID == "" {
+			continue
+		}
+		if planQuotaProviderKind(provider, candidate) == "codex" {
+			codex = true
+		}
+		weekly := "-"
+		if reset, ok := codexPrimaryReset(candidate, now); ok {
+			weekly = reset.Local().Format("01/02 15:04")
+		}
+		manual := "-"
+		if expiry, count, ok := codexEarliestManualReset(candidate.ID, now); ok {
+			manual = fmt.Sprintf("%s(n=%d)", expiry.Local().Format("01/02 15:04"), count)
+		}
+		mark := ""
+		if boosted[candidate.ID] {
+			mark = "*"
+		}
+		parts = append(parts, fmt.Sprintf("%s weekly=%s manual=%s weight=%d%s", ShortAuthLabel(candidate), weekly, manual, weights[candidate.ID], mark))
+	}
+	if !codex {
+		return
+	}
+	sort.Strings(parts)
+	sig := strings.Join(parts, "; ")
+	if s.planResetLogSigs == nil {
+		s.planResetLogSigs = make(map[string]string)
+	}
+	if s.planResetLogSigs[key] == sig {
+		return
+	}
+	if len(s.planResetLogSigs) >= 4096 {
+		s.planResetLogSigs = make(map[string]string)
+	}
+	s.planResetLogSigs[key] = sig
+	log.Infof("plan-quota routing weights | key=%s | %s", key, sig)
 }
 
 func canonicalLCPProvider(provider string) string {

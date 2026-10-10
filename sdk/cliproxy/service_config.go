@@ -63,6 +63,27 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	return state
 }
 
+// applyManualResetPriorityConfig installs routing.manual-reset-* settings.
+func applyManualResetPriorityConfig(cfg *config.Config) {
+	settings := coreauth.DefaultManualResetPrioritySettings()
+	if cfg != nil {
+		if cfg.Routing.ManualResetPriority != nil {
+			settings.Enabled = *cfg.Routing.ManualResetPriority
+		}
+		if raw := strings.TrimSpace(cfg.Routing.ManualResetBand); raw != "" {
+			if parsed, errParse := time.ParseDuration(raw); errParse == nil && parsed > 0 {
+				settings.Band = parsed
+			} else {
+				log.Warnf("invalid routing.manual-reset-band %q, using %s", raw, settings.Band)
+			}
+		}
+		if cfg.Routing.ManualResetBoost > 0 {
+			settings.Boost = int64(cfg.Routing.ManualResetBoost)
+		}
+	}
+	coreauth.ConfigureManualResetPriority(settings)
+}
+
 func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 	var selector coreauth.Selector
 	switch state.strategy {
@@ -222,6 +243,7 @@ func (s *Service) applyManagerConfig(ctx context.Context, commit configCommit) b
 		return false
 	}
 	routingState := normalizedRoutingRuntimeState(commit.cfg)
+	applyManualResetPriorityConfig(commit.cfg)
 	if s.appliedRoutingState == nil || *s.appliedRoutingState != routingState {
 		s.coreManager.SetSelector(newRoutingSelector(routingState))
 		s.appliedRoutingState = &routingState
