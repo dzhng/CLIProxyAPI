@@ -164,16 +164,18 @@ routing:
   # for maximum parallel concurrency.
   # Ignored when routing.session-affinity is false.
   session-affinity-subagents: true
-  # Manual-reset priority (Codex, plan-quota routing with session-affinity).
-  # Codex Pro accounts can bank "manual resets" that each reset the weekly limit
-  # once and expire on their own date. When the candidates' weekly windows reset
-  # within manual-reset-band of each other, the account whose earliest banked
-  # reset expires first gets its routing weight multiplied by manual-reset-boost,
-  # so its weekly limit is used first and the reset can be redeemed before it
-  # expires. The proxy only reads the reset list (refreshed about every 20 minutes
-  # per credential and whenever the management console loads quota); it never
-  # redeems a reset. Plan-exhausted credentials, expired resets and missing data
-  # are never boosted, and Claude routing is unchanged.
+  # Manual-reset priority (Codex and Claude, plan-quota routing with session-affinity).
+  # Codex Pro accounts can bank "manual resets", and Claude Pro/Max accounts can
+  # hold usage-limit reset grants; each resets the limit once and expires on its
+  # own date. When the candidates' weekly windows (Codex primary window, Claude
+  # 7-day window) reset within manual-reset-band of each other, the account whose
+  # earliest banked reset expires first gets its routing weight multiplied by
+  # manual-reset-boost, so its weekly limit is used first and the reset can be
+  # redeemed before it expires. Codex and Claude are compared only within their
+  # own pool. The proxy only reads the reset list (refreshed about every 20
+  # minutes per credential and whenever the management console loads quota); it
+  # never redeems a reset. Plan-exhausted credentials, expired resets and missing
+  # data are never boosted.
   manual-reset-priority: true # default: true
   manual-reset-band: "24h"    # default: 24h
   manual-reset-boost: 8       # default: 8 (about 67% of new sessions across 5 equal accounts)

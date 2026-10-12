@@ -377,9 +377,10 @@ type RoutingConfig struct {
 	// Default: true. Ignored when SessionAffinity is false.
 	SessionAffinitySubagents *bool `yaml:"session-affinity-subagents,omitempty" json:"session-affinity-subagents,omitempty"`
 
-	// ManualResetPriority boosts the Codex credential whose banked manual reset
-	// (rate-limit reset credit) expires soonest, when the candidates' weekly
-	// plan windows reset within ManualResetBand of each other. Only applies to
+	// ManualResetPriority boosts the Codex or Claude credential whose banked
+	// manual reset (Codex rate-limit reset credit, Claude usage-limit reset
+	// grant) expires soonest, when the same-provider candidates' weekly plan
+	// windows reset within ManualResetBand of each other. Only applies to
 	// plan-quota routing (session-affinity). Default: true.
 	ManualResetPriority *bool `yaml:"manual-reset-priority,omitempty" json:"manual-reset-priority,omitempty"`
 
