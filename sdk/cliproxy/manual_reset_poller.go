@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	// manualResetPollInterval is how often each Codex credential's banked
+	// manualResetPollInterval is how often each Codex or Claude credential's banked
 	// manual resets are re-read. The management console refreshes the same
 	// snapshot whenever it loads quota.
 	manualResetPollInterval = 20 * time.Minute
@@ -26,10 +26,15 @@ const (
 	manualResetMaxBody       = 1 << 20
 )
 
-// startCodexManualResetPoller keeps a read-only snapshot of each Codex
+// claudeManualResetUsageURL is the Claude read endpoint; tests point it at a
+// local server.
+var claudeManualResetUsageURL = coreauth.ClaudeManualResetUsageURL
+
+// startManualResetPoller keeps a read-only snapshot of each Codex and Claude
 // credential's banked manual resets for manual-reset priority routing. It only
-// performs GET requests against the listing endpoint and never redeems a reset.
-func (s *Service) startCodexManualResetPoller(ctx context.Context) {
+// performs GET requests against the listing/usage endpoints and never redeems
+// a reset.
+func (s *Service) startManualResetPoller(ctx context.Context) {
 	if s == nil || s.coreManager == nil {
 		return
 	}
@@ -44,34 +49,45 @@ func (s *Service) startCodexManualResetPoller(ctx context.Context) {
 				return
 			case <-timer.C:
 			}
-			s.pollCodexManualResets(ctx, attempts, lastLogged)
+			s.pollManualResets(ctx, attempts, lastLogged)
 			timer.Reset(manualResetPollTick)
 		}
 	}()
 }
 
-func (s *Service) pollCodexManualResets(ctx context.Context, attempts map[string]time.Time, lastLogged map[string]string) {
+func (s *Service) pollManualResets(ctx context.Context, attempts map[string]time.Time, lastLogged map[string]string) {
 	if !coreauth.ManualResetPriorityEnabled() {
 		return
 	}
 	now := time.Now()
 	seen := make(map[string]bool)
 	for _, auth := range s.coreManager.List() {
-		if auth == nil || auth.Disabled || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		if auth == nil || auth.Disabled {
+			continue
+		}
+		provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+		var fetchedAt func(string) (time.Time, bool)
+		var fetch func(context.Context, *coreauth.Auth) ([]time.Time, error)
+		switch provider {
+		case "codex":
+			fetchedAt, fetch = coreauth.CodexManualResetFetchedAt, s.fetchCodexManualResets
+		case "claude":
+			fetchedAt, fetch = coreauth.ClaudeManualResetFetchedAt, s.fetchClaudeManualResets
+		default:
 			continue
 		}
 		seen[auth.ID] = true
-		if fetchedAt, ok := coreauth.CodexManualResetFetchedAt(auth.ID); ok && now.Sub(fetchedAt) < manualResetPollInterval {
+		if last, ok := fetchedAt(auth.ID); ok && now.Sub(last) < manualResetPollInterval {
 			continue
 		}
 		if last, ok := attempts[auth.ID]; ok && now.Sub(last) < manualResetRetryInterval {
 			continue
 		}
 		attempts[auth.ID] = now
-		expiries, errFetch := s.fetchCodexManualResets(ctx, auth)
+		expiries, errFetch := fetch(ctx, auth)
 		label := coreauth.ShortAuthLabel(auth)
 		if errFetch != nil {
-			log.Debugf("codex manual resets: fetch failed | auth=%s err=%v", label, errFetch)
+			log.Debugf("%s manual resets: fetch failed | auth=%s err=%v", provider, label, errFetch)
 			continue
 		}
 		earliest := "-"
@@ -87,7 +103,7 @@ func (s *Service) pollCodexManualResets(ctx context.Context, attempts map[string
 		summary := fmt.Sprintf("available=%d earliest=%s", upcoming, earliest)
 		if lastLogged[auth.ID] != summary {
 			lastLogged[auth.ID] = summary
-			log.Infof("codex manual resets refreshed | auth=%s %s", label, summary)
+			log.Infof("%s manual resets refreshed | auth=%s %s", provider, label, summary)
 		}
 	}
 	for id := range attempts {
@@ -145,4 +161,46 @@ func (s *Service) fetchCodexManualResets(ctx context.Context, auth *coreauth.Aut
 		return nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
 	return coreauth.RecordCodexManualResetCredits(auth.ID, body, time.Now())
+}
+
+// fetchClaudeManualResets reads a Claude credential's usage-limit reset grants
+// with the same GET, headers, and per-credential proxy the management console
+// uses. It never calls the reset_rate_limits claim endpoint.
+func (s *Service) fetchClaudeManualResets(ctx context.Context, auth *coreauth.Auth) ([]time.Time, error) {
+	token := ""
+	if auth.Metadata != nil {
+		if v, ok := auth.Metadata["access_token"].(string); ok {
+			token = strings.TrimSpace(v)
+		}
+	}
+	if token == "" {
+		return nil, fmt.Errorf("no access token")
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, manualResetFetchTimeout)
+	defer cancel()
+	req, errReq := http.NewRequestWithContext(reqCtx, http.MethodGet, claudeManualResetUsageURL, nil)
+	if errReq != nil {
+		return nil, errReq
+	}
+	req.Header.Set("User-Agent", coreauth.ClaudeManualResetUserAgent)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("anthropic-beta", coreauth.ClaudeManualResetBeta)
+	s.cfgMu.RLock()
+	cfg := s.cfg
+	s.cfgMu.RUnlock()
+	client := helps.NewProxyAwareHTTPClient(reqCtx, cfg, auth, manualResetFetchTimeout)
+	resp, errDo := client.Do(req)
+	if errDo != nil {
+		return nil, errDo
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, manualResetMaxBody))
+	if errRead != nil {
+		return nil, errRead
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	return coreauth.RecordClaudeResetGrants(auth.ID, body, time.Now())
 }
