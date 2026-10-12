@@ -234,6 +234,7 @@ func (h *Handler) APICall(c *gin.Context) {
 	}
 
 	recordCodexManualResetSnapshot(method, parsedURL, auth, resp.StatusCode, respBody)
+	recordClaudeManualResetSnapshot(method, parsedURL, auth, resp.StatusCode, respBody)
 
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
@@ -258,6 +259,29 @@ func recordCodexManualResetSnapshot(method string, parsedURL *url.URL, auth *cor
 	}
 	if _, errRecord := coreauth.RecordCodexManualResetCredits(auth.ID, body, time.Now()); errRecord != nil {
 		log.Debugf("management APICall: ignored manual reset snapshot | auth=%s err=%v", coreauth.ShortAuthLabel(auth), errRecord)
+	}
+}
+
+// recordClaudeManualResetSnapshot reuses the console's read of a Claude
+// credential's usage-limit reset grants for manual-reset priority routing.
+// Only a successful GET of /api/oauth/usage with cedar_ember=1 on
+// api.anthropic.com is recorded; the reset_rate_limits claim (a POST under
+// /api/organizations/) is never matched.
+func recordClaudeManualResetSnapshot(method string, parsedURL *url.URL, auth *coreauth.Auth, status int, body []byte) {
+	if auth == nil || parsedURL == nil || method != http.MethodGet || status < 200 || status >= 300 {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
+		return
+	}
+	if !strings.EqualFold(parsedURL.Hostname(), "api.anthropic.com") || strings.TrimRight(parsedURL.Path, "/") != "/api/oauth/usage" {
+		return
+	}
+	if parsedURL.Query().Get("cedar_ember") != "1" {
+		return
+	}
+	if _, errRecord := coreauth.RecordClaudeResetGrants(auth.ID, body, time.Now()); errRecord != nil {
+		log.Debugf("management APICall: ignored claude reset snapshot | auth=%s err=%v", coreauth.ShortAuthLabel(auth), errRecord)
 	}
 }
 
