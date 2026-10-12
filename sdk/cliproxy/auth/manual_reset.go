@@ -16,19 +16,21 @@ import (
 	"time"
 )
 
-// Codex Pro accounts can bank "manual resets" (rate-limit reset credits). Each
-// one can be redeemed once to reset the weekly limit and expires on its own
-// date if unused. The proxy only ever reads the list of banked resets; it never
-// redeems one.
+// Codex Pro accounts can bank "manual resets" (rate-limit reset credits), and
+// Claude Pro/Max accounts can hold usage-limit reset grants (the "cedar_ember"
+// program). Each one can be redeemed once to reset the usage limit and expires
+// on its own date if unused. The proxy only ever reads the list of banked
+// resets; it never redeems one.
 //
-// Manual-reset priority: when the weekly plan windows of the candidate Codex
-// credentials all reset within ManualResetPrioritySettings.Band of each other,
-// the plan-reset weight of the credential whose earliest unexpired manual reset
-// expires first is multiplied by Boost. That steers most new sessions onto the
-// account whose banked reset would otherwise be wasted, while the others keep
-// receiving a share. Missing data, expired resets, plan-exhausted credentials,
-// and non-Codex credentials are never boosted, so without data the routing is
-// exactly the plan-reset weighting.
+// Manual-reset priority: when the weekly plan windows of the candidate
+// credentials of one provider (Codex with Codex, Claude with Claude) all reset
+// within ManualResetPrioritySettings.Band of each other, the plan-reset weight
+// of the credential whose earliest unexpired manual reset expires first is
+// multiplied by Boost. That steers most new sessions onto the account whose
+// banked reset would otherwise be wasted, while the others keep receiving a
+// share. Missing data, expired resets, plan-exhausted credentials, and
+// credentials of other providers are never boosted, so without data the
+// routing is exactly the plan-reset weighting.
 
 const (
 	// DefaultManualResetBand is how close the weekly resets must be to count
@@ -50,6 +52,22 @@ const (
 	// CodexManualResetCreditsURL is the read-only endpoint listing banked
 	// manual resets. The ".../consume" sibling redeems one and is never called.
 	CodexManualResetCreditsURL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+
+	// ClaudeManualResetUsageURL is the read-only usage endpoint the management
+	// console reads Claude reset grants from (the "cedar_ember" block). Grants
+	// are redeemed with a POST to /api/organizations/{org}/reset_rate_limits,
+	// which the proxy never calls.
+	ClaudeManualResetUsageURL = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"
+	// ClaudeManualResetUserAgent and ClaudeManualResetBeta match the headers
+	// the management console sends for the same read.
+	ClaudeManualResetUserAgent = "claude-cli/2.1.280 (external, cli)"
+	ClaudeManualResetBeta      = "oauth-2025-04-20"
+
+	// maxClaudeGrantResets bounds how many banked resets one grant may add.
+	maxClaudeGrantResets = 100
+
+	manualResetKindCodex  = "codex"
+	manualResetKindClaude = "claude"
 )
 
 // ManualResetPrioritySettings configures manual-reset priority routing.
@@ -90,6 +108,7 @@ func currentManualResetSettings() ManualResetPrioritySettings {
 }
 
 type manualResetRecord struct {
+	kind      string
 	expiries  []time.Time
 	fetchedAt time.Time
 }
@@ -195,10 +214,18 @@ func SetCodexManualResetExpiries(authID string, expiries []time.Time, now time.T
 	if authID == "" {
 		return
 	}
+	setManualResetExpiries(manualResetKindCodex, authID, expiries, now)
+}
+
+func setManualResetExpiries(kind, authID string, expiries []time.Time, now time.Time) {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
 	copied := append([]time.Time(nil), expiries...)
 	sort.Slice(copied, func(i, j int) bool { return copied[i].Before(copied[j]) })
 	manualResetStore.Lock()
-	manualResetStore.byAuth[authID] = manualResetRecord{expiries: copied, fetchedAt: now}
+	manualResetStore.byAuth[authID] = manualResetRecord{kind: kind, expiries: copied, fetchedAt: now}
 	manualResetStore.Unlock()
 }
 
@@ -209,21 +236,32 @@ func ForgetCodexManualResets(authID string) {
 	manualResetStore.Unlock()
 }
 
-// CodexManualResetFetchedAt reports when the snapshot for authID was stored.
+// CodexManualResetFetchedAt reports when the Codex snapshot for authID was stored.
 func CodexManualResetFetchedAt(authID string) (time.Time, bool) {
+	return manualResetFetchedAt(manualResetKindCodex, authID)
+}
+
+func manualResetFetchedAt(kind, authID string) (time.Time, bool) {
 	manualResetStore.RLock()
 	record, ok := manualResetStore.byAuth[strings.TrimSpace(authID)]
 	manualResetStore.RUnlock()
-	return record.fetchedAt, ok
+	if !ok || record.kind != kind {
+		return time.Time{}, false
+	}
+	return record.fetchedAt, true
 }
 
 // codexEarliestManualReset returns the earliest unexpired banked reset and the
 // count of unexpired resets. A missing or stale snapshot reports false.
 func codexEarliestManualReset(authID string, now time.Time) (time.Time, int, bool) {
+	return earliestManualReset(manualResetKindCodex, authID, now)
+}
+
+func earliestManualReset(kind, authID string, now time.Time) (time.Time, int, bool) {
 	manualResetStore.RLock()
 	record, ok := manualResetStore.byAuth[strings.TrimSpace(authID)]
 	manualResetStore.RUnlock()
-	if !ok || now.Sub(record.fetchedAt) > manualResetDataTTL {
+	if !ok || record.kind != kind || now.Sub(record.fetchedAt) > manualResetDataTTL {
 		return time.Time{}, 0, false
 	}
 	var earliest time.Time
@@ -240,23 +278,62 @@ func codexEarliestManualReset(authID string, now time.Time) (time.Time, int, boo
 	return earliest, count, count > 0
 }
 
-// applyManualResetPriority multiplies, in place, the weight of the Codex
+// applyManualResetPriority multiplies, in place, the weight of the
 // credential(s) with the soonest-expiring banked manual reset when the weekly
-// resets of the candidates are within the configured band. It reports which
-// credentials were boosted.
+// resets of the candidates are within the configured band. Codex and Claude
+// candidates are evaluated as separate pools, each against its own kind of
+// banked reset. It reports which credentials were boosted.
 func applyManualResetPriority(provider string, auths []*Auth, weights map[string]int64, now time.Time, settings ManualResetPrioritySettings) map[string]bool {
 	if !settings.Enabled || settings.Boost < 2 || len(auths) == 0 || len(weights) == 0 {
 		return nil
 	}
+	var boosted map[string]bool
+	for _, kind := range []string{manualResetKindCodex, manualResetKindClaude} {
+		for id := range applyManualResetPriorityForKind(kind, provider, auths, weights, now, settings) {
+			if boosted == nil {
+				boosted = make(map[string]bool, 1)
+			}
+			boosted[id] = true
+		}
+	}
+	return boosted
+}
+
+// manualResetWeeklyReset is the weekly plan reset used for the band check:
+// the Codex primary window, or the Claude 7-day window.
+func manualResetWeeklyReset(kind string, auth *Auth, now time.Time) (time.Time, bool) {
+	switch kind {
+	case manualResetKindCodex:
+		return codexPrimaryReset(auth, now)
+	case manualResetKindClaude:
+		return claudeWeeklyReset(auth)
+	default:
+		return time.Time{}, false
+	}
+}
+
+// claudeWeeklyReset reads the stored Anthropic unified 7-day reset.
+func claudeWeeklyReset(auth *Auth) (time.Time, bool) {
+	if auth == nil {
+		return time.Time{}, false
+	}
+	raw := quotaSignal(auth.Quota.Signals, "Anthropic-Ratelimit-Unified-7d-Reset")
+	if raw == "" {
+		return time.Time{}, false
+	}
+	return parseResetTimestamp(raw)
+}
+
+func applyManualResetPriorityForKind(kind, provider string, auths []*Auth, weights map[string]int64, now time.Time, settings ManualResetPrioritySettings) map[string]bool {
 	var minReset, maxReset time.Time
 	haveReset := false
-	codexCandidates := make([]*Auth, 0, len(auths))
+	kindCandidates := make([]*Auth, 0, len(auths))
 	for _, candidate := range auths {
-		if candidate == nil || candidate.ID == "" || planQuotaProviderKind(provider, candidate) != "codex" {
+		if candidate == nil || candidate.ID == "" || planQuotaProviderKind(provider, candidate) != kind {
 			continue
 		}
-		codexCandidates = append(codexCandidates, candidate)
-		reset, ok := codexPrimaryReset(candidate, now)
+		kindCandidates = append(kindCandidates, candidate)
+		reset, ok := manualResetWeeklyReset(kind, candidate, now)
 		if !ok {
 			continue
 		}
@@ -268,22 +345,22 @@ func applyManualResetPriority(provider string, auths []*Auth, weights map[string
 		}
 		haveReset = true
 	}
-	if len(codexCandidates) == 0 {
+	if len(kindCandidates) == 0 {
 		return nil
 	}
 	if haveReset && maxReset.Sub(minReset) > settings.Band {
 		return nil
 	}
-	earliestByID := make(map[string]time.Time, len(codexCandidates))
+	earliestByID := make(map[string]time.Time, len(kindCandidates))
 	var earliest time.Time
-	for _, candidate := range codexCandidates {
+	for _, candidate := range kindCandidates {
 		if authPlanWindowExhausted(provider, candidate) {
 			continue
 		}
 		if _, ok := weights[candidate.ID]; !ok {
 			continue
 		}
-		expiry, _, ok := codexEarliestManualReset(candidate.ID, now)
+		expiry, _, ok := earliestManualReset(kind, candidate.ID, now)
 		if !ok {
 			continue
 		}
