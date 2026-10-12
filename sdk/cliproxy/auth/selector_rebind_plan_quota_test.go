@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"net/http"
 	"testing"
 	"time"
@@ -119,5 +120,73 @@ func TestRebindOnQuotaPreservesBindingWhenAllPlansExhausted(t *testing.T) {
 	b := quotaAuth("auth-b", "codex", ex)
 	if !selector.shouldPreserveBindingWithPlanQuota(context.Background(), "codex", []*Auth{bound, b}, []*Auth{b}, "gpt-5", "auth-a", time.Now()) {
 		t.Fatalf("shouldPreserveBindingWithPlanQuota() = false, want true when no plan quota remains anywhere")
+	}
+}
+
+// Manager path (prevalidated candidates): a bound Codex login that is transiently failing AND
+// plan-exhausted must lose its binding when other logins still have plan quota, so the session
+// sticks to one replacement instead of hopping between quota logins on every request.
+func TestManagerRebindOnQuotaDropsPlanExhaustedBindingOnTransientFailure(t *testing.T) {
+	ctx := context.Background()
+	provider := "codex"
+	model := "rebind-plan-quota-manager-model"
+	ids := []string{"rpq-mgr-a", "rpq-mgr-b", "rpq-mgr-c"}
+
+	manager := NewManager(nil, nil, nil)
+	affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Hour,
+		RebindOn: SessionAffinityRebindOnQuota,
+	})
+	defer affinity.Stop()
+	manager.SetSelector(affinity)
+	manager.RegisterExecutor(schedulerTestExecutor{provider: provider})
+	for i, id := range ids {
+		auth := quotaAuth(id, provider, codexSignals("10", "10080", "false", "false"))
+		auth.Status = StatusActive
+		auth.Attributes = map[string]string{"priority": map[bool]string{true: "1", false: "0"}[i == 0]}
+		if _, err := manager.Register(WithSkipPersist(ctx), auth); err != nil {
+			t.Fatalf("Register(%s): %v", id, err)
+		}
+		registry.GetGlobalRegistry().RegisterClient(id, provider, []*registry.ModelInfo{{ID: model}})
+		idCopy := id
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(idCopy) })
+	}
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.DerivedSessionIDMetadataKey: "rpq-session"}}
+	pick := func() *Auth {
+		t.Helper()
+		auth, _, err := manager.pickNext(ctx, provider, model, opts, nil)
+		if err != nil || auth == nil {
+			t.Fatalf("pick: %v %v", auth, err)
+		}
+		return auth
+	}
+	if got := pick(); got.ID != ids[0] {
+		t.Fatalf("cold pick = %s, want %s", got.ID, ids[0])
+	}
+	manager.MarkResult(ctx, Result{AuthID: ids[0], Provider: provider, Model: model, Success: true, Options: opts})
+
+	// Bound login runs out of plan quota (credits only) and then fails transiently.
+	exhausted, _ := manager.GetByID(ids[0])
+	exhausted = exhausted.Clone()
+	exhausted.Quota.Signals = codexSignals("100", "10080", "true", "true")
+	if _, err := manager.Update(WithSkipPersist(ctx), exhausted); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	manager.MarkResult(ctx, Result{AuthID: ids[0], Provider: provider, Model: model, Success: false,
+		Error: &Error{HTTPStatus: http.StatusBadGateway, Message: "502 overloaded"}, Options: opts})
+
+	first := pick()
+	if first.ID == ids[0] {
+		t.Fatalf("failover pick = bound exhausted login")
+	}
+	manager.MarkResult(ctx, Result{AuthID: first.ID, Provider: provider, Model: model, Success: true, Options: opts})
+	expireSessionAffinityPriorityModelCooldown(t, manager, ids[0], model)
+	for i := 0; i < 4; i++ {
+		got := pick()
+		if got.ID != first.ID {
+			t.Fatalf("pick #%d = %s, want session to stay on replacement %s", i, got.ID, first.ID)
+		}
+		manager.MarkResult(ctx, Result{AuthID: got.ID, Provider: provider, Model: model, Success: true, Options: opts})
 	}
 }
