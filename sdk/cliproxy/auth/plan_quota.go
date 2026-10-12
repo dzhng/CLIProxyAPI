@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"math"
 	"strconv"
 	"strings"
@@ -330,4 +331,46 @@ func planQuotaRoutingFellBack(provider string, auths []*Auth) bool {
 		}
 	}
 	return saw
+}
+
+type planExhaustedAuthIDsKey struct{}
+
+func withPlanExhaustedAuthIDs(ctx context.Context, authIDs map[string]struct{}) context.Context {
+	if len(authIDs) == 0 {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, planExhaustedAuthIDsKey{}, authIDs)
+}
+
+func planExhaustedAuthIDsFromContext(ctx context.Context) map[string]struct{} {
+	if ctx == nil {
+		return nil
+	}
+	authIDs, _ := ctx.Value(planExhaustedAuthIDsKey{}).(map[string]struct{})
+	return authIDs
+}
+
+// planExhaustedSessionAffinityAuthIDs records which affinity candidates (including ones that
+// are cooling down and therefore absent from the selector's candidate list) have exhausted
+// their included plan window. Callers must hold the Manager lock. Only used with
+// rebind-on=quota, where it lets a preserved binding be dropped for a plan-exhausted login.
+func planExhaustedSessionAffinityAuthIDs(selector Selector, candidates []*Auth) map[string]struct{} {
+	affinity, ok := selector.(*SessionAffinitySelector)
+	if !ok || affinity == nil || !affinity.rebindOnQuotaOnly || len(candidates) == 0 {
+		return nil
+	}
+	var authIDs map[string]struct{}
+	for _, candidate := range candidates {
+		if candidate == nil || candidate.ID == "" || !authPlanWindowExhausted(candidate.Provider, candidate) {
+			continue
+		}
+		if authIDs == nil {
+			authIDs = make(map[string]struct{}, len(candidates))
+		}
+		authIDs[candidate.ID] = struct{}{}
+	}
+	return authIDs
 }
