@@ -1071,7 +1071,13 @@ func (s *SessionAffinitySelector) shouldPreserveBindingWithPlanQuota(ctx context
 			break
 		}
 	}
-	if bound == nil || !authPlanWindowExhausted(provider, bound) {
+	// On the Manager path the bound auth is usually absent from candidates (it is cooling
+	// down), so fall back to the plan-exhausted set the Manager recorded under its lock.
+	boundExhausted := bound != nil && authPlanWindowExhausted(provider, bound)
+	if bound == nil {
+		_, boundExhausted = planExhaustedAuthIDsFromContext(ctx)[authID]
+	}
+	if !boundExhausted {
 		return true
 	}
 	for _, candidate := range routingAuths {
