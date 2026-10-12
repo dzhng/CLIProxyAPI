@@ -1156,7 +1156,7 @@ func (s *SessionAffinitySelector) Trees() *cliproxysession.InMemorySessionTreeSt
 // credential whose stored included-plan window is exhausted is treated as unavailable
 // when any other available credential still has plan quota, and is rebound inside that
 // quota subset. New sessions and rebinds inside the quota subset use reset-weighted
-// round-robin (sooner plan reset, higher weight, times the Codex manual-reset boost),
+// round-robin (sooner plan reset, higher weight, times the Codex/Claude manual-reset boost),
 // with no special case after idle periods. When every
 // credential is plan-exhausted the configured fallback selector still runs on the full
 // set. Credentials with no usage snapshot are not treated as plan-exhausted. Credential
@@ -1534,7 +1534,7 @@ func (s *SessionAffinitySelector) pickPlanResetWeighted(provider, model string, 
 	return picked, nil
 }
 
-// logPlanResetWeightsLocked logs the Codex plan-reset weight table whenever it
+// logPlanResetWeightsLocked logs the Codex or Claude plan-reset weight table whenever it
 // changes for a provider/model key. Labels are short file ids; emails and
 // tokens are never logged. Callers must hold planResetMu.
 func (s *SessionAffinitySelector) logPlanResetWeightsLocked(provider, key string, auths []*Auth, weights map[string]int64, boosted map[string]bool, now time.Time) {
@@ -1542,20 +1542,21 @@ func (s *SessionAffinitySelector) logPlanResetWeightsLocked(provider, key string
 		return
 	}
 	parts := make([]string, 0, len(auths))
-	codex := false
+	logged := false
 	for _, candidate := range auths {
 		if candidate == nil || candidate.ID == "" {
 			continue
 		}
-		if planQuotaProviderKind(provider, candidate) == "codex" {
-			codex = true
+		kind := planQuotaProviderKind(provider, candidate)
+		if kind == manualResetKindCodex || kind == manualResetKindClaude {
+			logged = true
 		}
 		weekly := "-"
-		if reset, ok := codexPrimaryReset(candidate, now); ok {
+		if reset, ok := manualResetWeeklyReset(kind, candidate, now); ok {
 			weekly = reset.Local().Format("01/02 15:04")
 		}
 		manual := "-"
-		if expiry, count, ok := codexEarliestManualReset(candidate.ID, now); ok {
+		if expiry, count, ok := earliestManualReset(kind, candidate.ID, now); ok {
 			manual = fmt.Sprintf("%s(n=%d)", expiry.Local().Format("01/02 15:04"), count)
 		}
 		mark := ""
@@ -1564,7 +1565,7 @@ func (s *SessionAffinitySelector) logPlanResetWeightsLocked(provider, key string
 		}
 		parts = append(parts, fmt.Sprintf("%s weekly=%s manual=%s weight=%d%s", ShortAuthLabel(candidate), weekly, manual, weights[candidate.ID], mark))
 	}
-	if !codex {
+	if !logged {
 		return
 	}
 	sort.Strings(parts)
