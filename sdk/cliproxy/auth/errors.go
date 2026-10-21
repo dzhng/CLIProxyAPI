@@ -30,6 +30,13 @@ const transientTransportErrorCode = ErrorCodeTransientTransport
 // ErrorCodeForceCooldown marks failures that must enforce credential cooldown.
 const ErrorCodeForceCooldown = "force_cooldown"
 
+// ErrorCodeGlobalOverload marks transient platform-wide capacity failures (server_is_overloaded,
+// model_at_capacity, rate_limit) that should rotate credentials without cooling individual
+// credentials. These are distinct from quota/usage limits which are credential-scoped.
+const ErrorCodeGlobalOverload = "global_overload"
+
+const globalOverloadErrorCode = ErrorCodeGlobalOverload
+
 // Error describes an authentication related failure in a provider agnostic format.
 type Error struct {
 	// Code is a short machine readable identifier.

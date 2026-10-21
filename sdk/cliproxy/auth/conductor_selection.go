@@ -1501,6 +1501,12 @@ func isRequestRetryRoundError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// Global overload errors should only try each credential once (no retry rounds).
+	// This bounds the total attempts to ~number of available credentials rather than
+	// allowing retry rounds to multiply attempts.
+	if isGlobalOverloadError(err) {
+		return false
+	}
 	return isCredentialRetryRoundStatus(statusCodeFromError(err)) || isTransientTransportError(err)
 }
 
