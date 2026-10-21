@@ -1929,12 +1929,14 @@ func resultErrorFromError(err error) *Error {
 
 // isGlobalOverloadError reports whether the error represents a transient platform-wide
 // capacity failure that should allow credential rotation without cooling.
+// Only matches errors with explicit 503 or 429 status codes to avoid misclassifying
+// unknown-status errors that happen to contain overload-like text.
 func isGlobalOverloadError(err error) bool {
 	if err == nil {
 		return false
 	}
 	status := statusCodeFromError(err)
-	if status != http.StatusServiceUnavailable && status != http.StatusTooManyRequests && status != 0 {
+	if status != http.StatusServiceUnavailable && status != http.StatusTooManyRequests {
 		return false
 	}
 	return isGlobalOverloadErrorMessage(err.Error())
@@ -1970,9 +1972,14 @@ func isGlobalOverloadResultError(err *Error) bool {
 
 // isGlobalOverloadErrorMessage checks for platform-wide overload patterns in error messages.
 // This detects errors that indicate transient capacity issues across the platform,
-// not credential-specific quota exhaustion. It matches only explicit overload signals
-// like server_is_overloaded and model_at_capacity, NOT generic rate_limit_error which
-// typically indicates per-credential or per-model rate limits that should cool credentials.
+// not credential-specific quota exhaustion. It matches only explicit overload signals:
+// - server_is_overloaded: OpenAI's explicit overload code
+// - servers are currently overloaded: OpenAI's overload message text
+// - model is at capacity / model_at_capacity: capacity rejections
+// - server_error with "retry your request": retry advice indicating transient failure
+//
+// Does NOT match generic error types like service_unavailable_error alone, as these
+// could represent various 503 errors that should still cool credentials.
 func isGlobalOverloadErrorMessage(message string) bool {
 	lower := strings.ToLower(strings.TrimSpace(message))
 	if lower == "" {
@@ -1980,7 +1987,6 @@ func isGlobalOverloadErrorMessage(message string) bool {
 	}
 	switch {
 	case strings.Contains(lower, "server_is_overloaded"),
-		strings.Contains(lower, "service_unavailable_error"),
 		strings.Contains(lower, "servers are currently overloaded"),
 		strings.Contains(lower, "model is at capacity"),
 		strings.Contains(lower, "model_at_capacity"),

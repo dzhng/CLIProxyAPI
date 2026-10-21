@@ -181,17 +181,16 @@ func TestExecuteStream_BootstrapCapacity_SkipsConsecutiveOverloadedCredentials(t
 }
 
 // The credential budget must be honoured: when every credential is overloaded the request fails
-// after exhausting retry rounds rather than looping forever. Global overload errors do not
-// cool credentials, so all credentials remain available each round.
+// after one sweep of available credentials. Global overload errors do not cool credentials but
+// also do not trigger retry rounds, so each credential is tried at most once per request.
 func TestExecuteStream_BootstrapOverload_StopsAtCredentialBudget(t *testing.T) {
 	previous := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
 	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
 
 	m := NewManager(nil, nil, nil)
-	// Six credentials exist and only four may be attempted per round.
-	// With request-retry=5 (6 total rounds) and no cooldown for global overload,
-	// each round can try all 4 credentials = up to 24 total attempts.
+	// Six credentials exist and only four may be attempted (max-retry-credentials=4).
+	// Global overload errors do not trigger retry rounds, so at most 4 attempts total.
 	m.SetRetryConfig(5, 0, 4)
 	registerOverloadAuths(t, m, 6)
 
@@ -224,14 +223,12 @@ func TestExecuteStream_BootstrapOverload_StopsAtCredentialBudget(t *testing.T) {
 	if attempts == 0 {
 		t.Fatal("expected at least one attempt")
 	}
-	// Global overload errors don't cool credentials, so each retry round can
-	// attempt all 4 credentials. With request-retry=5 (6 total rounds):
-	// - Minimum: 4 (one round)
-	// - Maximum: 6 rounds * 4 credentials = 24
-	if attempts < 4 || attempts > 24 {
-		t.Fatalf("attempts = %d, want between 4 and 24", attempts)
+	// Global overload errors do not trigger retry rounds, so we get exactly one
+	// sweep through available credentials, bounded by max-retry-credentials.
+	if attempts > 4 {
+		t.Fatalf("attempts = %d, want at most 4 (max-retry-credentials)", attempts)
 	}
-	t.Logf("total upstream attempts across retry sweeps: %d", attempts)
+	t.Logf("total upstream attempts (bounded to one sweep): %d", attempts)
 }
 
 // Global overload errors must NOT cool down the credential: a subsequent request
@@ -305,5 +302,49 @@ func TestExecuteStream_GlobalOverload_DoesNotCoolCredential(t *testing.T) {
 
 	if totalRequests < 2 {
 		t.Fatalf("expected at least 2 total requests, got %d", totalRequests)
+	}
+}
+
+// Global overload errors must not trigger retry rounds, only allow trying different credentials
+// within the same round. This bounds total attempts to ~number of credentials, not rounds × credentials.
+func TestIsRequestRetryRoundError_GlobalOverloadReturnsFalse(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       error
+		wantRound bool
+	}{
+		{
+			name:      "server_is_overloaded 503",
+			err:       overloadStatusError(),
+			wantRound: false,
+		},
+		{
+			name:      "model_at_capacity 429",
+			err:       capacityStatusError(),
+			wantRound: false,
+		},
+		{
+			name: "generic 503 without overload message",
+			err: customStatusError{
+				code: http.StatusServiceUnavailable,
+				msg:  `{"error":{"message":"Service temporarily unavailable"}}`,
+			},
+			wantRound: true,
+		},
+		{
+			name: "generic 502 bad gateway",
+			err: customStatusError{
+				code: http.StatusBadGateway,
+				msg:  `{"error":{"message":"Bad gateway"}}`,
+			},
+			wantRound: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isRequestRetryRoundError(tt.err); got != tt.wantRound {
+				t.Fatalf("isRequestRetryRoundError() = %t, want %t", got, tt.wantRound)
+			}
+		})
 	}
 }
