@@ -166,3 +166,38 @@ func TestCodexExecutor_ProductionOverloadFormat_DisabledBuffering(t *testing.T) 
 
 	t.Logf("Confirmed: Without buffering, error is delivered in-stream with status %d", errorStatus)
 }
+
+// TestCodexExecutor_ProductionOverloadFormat_WithResponseMetadata reproduces the live wire capture:
+// created(0), in_progress(1), response.metadata(2), error server_is_overloaded(3). The metadata
+// frame must not release the bootstrap buffer, so the overload surfaces as a synchronous 503.
+func TestCodexExecutor_ProductionOverloadFormat_WithResponseMetadata(t *testing.T) {
+	server := createProductionScenarioServer(
+		`{"type":"response.created","response":{"id":"resp_1","model":"gpt-5.6-terra"},"sequence_number":0}`,
+		`{"type":"response.in_progress","response":{"id":"resp_1"},"sequence_number":1}`,
+		`{"type":"response.metadata","response_id":"resp_1","sequence_number":2,"metadata":["openai_chatgpt_moderation_metadata"]}`,
+		productionOverloadError,
+	)
+	defer server.Close()
+
+	cfg := &config.Config{Codex: config.CodexConfig{StreamBootstrapBuffering: true, StreamBootstrapTimeout: "20s"}}
+	codexExecutor := NewCodexExecutor(cfg)
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": server.URL, "api_key": "test-key"}}
+	req := cliproxyexecutor.Request{Model: "gpt-5.6-terra", Payload: []byte(`{"model":"gpt-5.6-terra","input":"hello"}`)}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), Stream: true}
+
+	result, err := codexExecutor.ExecuteStream(context.Background(), auth, req, opts)
+	if err == nil {
+		if result != nil && result.Chunks != nil {
+			for range result.Chunks {
+			}
+		}
+		t.Fatal("expected a synchronous 503 overload error; response.metadata released the stream")
+	}
+	statusCode := 0
+	if sc, ok := err.(interface{ StatusCode() int }); ok {
+		statusCode = sc.StatusCode()
+	}
+	if statusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %v", statusCode, err)
+	}
+}

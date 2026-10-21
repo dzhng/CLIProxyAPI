@@ -515,6 +515,12 @@ func isCodexBootstrapBufferableEvent(eventType string, payload []byte) bool {
 	switch eventType {
 	case "response.created", "response.in_progress", "codex.rate_limits", "codex.response.metadata", "keepalive":
 		return true
+	case "response.metadata":
+		// Upstream sends this moderation-metadata frame (for example
+		// {"metadata":["openai_chatgpt_moderation_metadata"]}) right before an in-stream
+		// server_is_overloaded rejection at sequence_number 3. It carries no generated content,
+		// so holding it keeps the overload catchable for failover instead of releasing the stream.
+		return true
 	case "response.output_item.added":
 		return isCodexBufferableOutputItem(payload)
 	case "response.content_part.added":
