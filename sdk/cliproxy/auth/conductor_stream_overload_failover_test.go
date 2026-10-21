@@ -181,14 +181,17 @@ func TestExecuteStream_BootstrapCapacity_SkipsConsecutiveOverloadedCredentials(t
 }
 
 // The credential budget must be honoured: when every credential is overloaded the request fails
-// after max-retry-credentials attempts rather than looping forever.
+// after exhausting retry rounds rather than looping forever. Global overload errors do not
+// cool credentials, so all credentials remain available each round.
 func TestExecuteStream_BootstrapOverload_StopsAtCredentialBudget(t *testing.T) {
 	previous := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
 	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
 
 	m := NewManager(nil, nil, nil)
-	// Six credentials exist and only four may be attempted in one round.
+	// Six credentials exist and only four may be attempted per round.
+	// With request-retry=5 (6 total rounds) and no cooldown for global overload,
+	// each round can try all 4 credentials = up to 24 total attempts.
 	m.SetRetryConfig(5, 0, 4)
 	registerOverloadAuths(t, m, 6)
 
@@ -221,10 +224,86 @@ func TestExecuteStream_BootstrapOverload_StopsAtCredentialBudget(t *testing.T) {
 	if attempts == 0 {
 		t.Fatal("expected at least one attempt")
 	}
-	// A no-wait retry round may consume the remaining two credentials after the
-	// first four-credential sweep, but it must not exceed the available set.
-	if attempts < 4 || attempts > 6 {
-		t.Fatalf("attempts = %d, want between 4 and 6", attempts)
+	// Global overload errors don't cool credentials, so each retry round can
+	// attempt all 4 credentials. With request-retry=5 (6 total rounds):
+	// - Minimum: 4 (one round)
+	// - Maximum: 6 rounds * 4 credentials = 24
+	if attempts < 4 || attempts > 24 {
+		t.Fatalf("attempts = %d, want between 4 and 24", attempts)
 	}
 	t.Logf("total upstream attempts across retry sweeps: %d", attempts)
+}
+
+// Global overload errors must NOT cool down the credential: a subsequent request
+// should be able to use the same credential immediately.
+func TestExecuteStream_GlobalOverload_DoesNotCoolCredential(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	prevTransient := transientErrorCooldownSeconds.Load()
+	SetTransientErrorCooldownSeconds(60)
+	t.Cleanup(func() { transientErrorCooldownSeconds.Store(prevTransient) })
+
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(5, 0, 6)
+	ids := registerOverloadAuths(t, m, 2)
+
+	var mu sync.Mutex
+	requestCount := 0
+	overloadFirst := true
+
+	m.RegisterExecutor(&customStreamMockExecutor{
+		identifier: "codex",
+		streamFn: func(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+			mu.Lock()
+			requestCount++
+			current := requestCount
+			shouldOverload := overloadFirst
+			overloadFirst = false
+			mu.Unlock()
+
+			if shouldOverload && auth.ID == ids[0] {
+				return nil, overloadStatusError()
+			}
+			_ = current
+			return successStreamResult(), nil
+		},
+	})
+
+	result, err := m.ExecuteStream(context.Background(), []string{"codex"},
+		cliproxyexecutor.Request{Model: "gpt-5.6-terra"}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("first request failed: %v", err)
+	}
+	for range result.Chunks {
+	}
+
+	m.mu.RLock()
+	auth1 := m.auths[ids[0]]
+	var auth1NextRetry time.Time
+	if auth1 != nil {
+		auth1NextRetry = auth1.NextRetryAfter
+	}
+	m.mu.RUnlock()
+
+	if !auth1NextRetry.IsZero() {
+		t.Fatalf("global overload should NOT cool the credential, but NextRetryAfter=%v", auth1NextRetry)
+	}
+
+	result2, err2 := m.ExecuteStream(context.Background(), []string{"codex"},
+		cliproxyexecutor.Request{Model: "gpt-5.6-terra"}, cliproxyexecutor.Options{})
+	if err2 != nil {
+		t.Fatalf("second request failed: %v", err2)
+	}
+	for range result2.Chunks {
+	}
+
+	mu.Lock()
+	totalRequests := requestCount
+	mu.Unlock()
+
+	if totalRequests < 2 {
+		t.Fatalf("expected at least 2 total requests, got %d", totalRequests)
+	}
 }

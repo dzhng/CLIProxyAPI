@@ -1919,8 +1919,25 @@ func resultErrorFromError(err error) *Error {
 		if resultErr.Code == "" || resultErr.Code == transientTransportErrorCode {
 			resultErr.Code = transientTransportErrorCode
 		}
+	case isGlobalOverloadError(err):
+		if resultErr.Code == "" || resultErr.Code == globalOverloadErrorCode {
+			resultErr.Code = globalOverloadErrorCode
+		}
 	}
 	return resultErr
+}
+
+// isGlobalOverloadError reports whether the error represents a transient platform-wide
+// capacity failure that should allow credential rotation without cooling.
+func isGlobalOverloadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	status := statusCodeFromError(err)
+	if status != http.StatusServiceUnavailable && status != http.StatusTooManyRequests && status != 0 {
+		return false
+	}
+	return isGlobalOverloadErrorMessage(err.Error())
 }
 
 // shouldSkipCredentialCooldown reports failures that must not mark auth/model cooling.
@@ -1930,7 +1947,49 @@ func shouldSkipCredentialCooldown(err *Error) bool {
 	if err != nil && err.Code == ErrorCodeForceCooldown {
 		return false
 	}
-	return isRequestScopedResultError(err) || isConnectionLifecycleResultError(err) || isTransientTransportResultError(err)
+	return isRequestScopedResultError(err) || isConnectionLifecycleResultError(err) || isTransientTransportResultError(err) || isGlobalOverloadResultError(err)
+}
+
+// isGlobalOverloadResultError reports whether the error represents a transient
+// platform-wide capacity failure (server_is_overloaded, model_at_capacity, rate_limit)
+// that should NOT penalize individual credentials. These errors allow retry on other
+// credentials without cooling the one that received the rejection.
+func isGlobalOverloadResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	if err.Code == globalOverloadErrorCode {
+		return true
+	}
+	status := statusCodeFromResult(err)
+	if status != http.StatusServiceUnavailable && status != http.StatusTooManyRequests {
+		return false
+	}
+	return isGlobalOverloadErrorMessage(err.Message)
+}
+
+// isGlobalOverloadErrorMessage checks for platform-wide overload patterns in error messages.
+// This detects errors that indicate transient capacity issues across the platform,
+// not credential-specific quota exhaustion. It matches only explicit overload signals
+// like server_is_overloaded and model_at_capacity, NOT generic rate_limit_error which
+// typically indicates per-credential or per-model rate limits that should cool credentials.
+func isGlobalOverloadErrorMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	switch {
+	case strings.Contains(lower, "server_is_overloaded"),
+		strings.Contains(lower, "service_unavailable_error"),
+		strings.Contains(lower, "servers are currently overloaded"),
+		strings.Contains(lower, "model is at capacity"),
+		strings.Contains(lower, "model_at_capacity"),
+		strings.Contains(lower, "model_is_at_capacity"),
+		strings.Contains(lower, "server_error") && strings.Contains(lower, "retry your request"):
+		return true
+	default:
+		return false
+	}
 }
 
 // isConnectionLifecycleError reports transport/session lifecycle failures that must
