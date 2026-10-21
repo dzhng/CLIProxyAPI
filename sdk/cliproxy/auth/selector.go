@@ -989,6 +989,35 @@ func sessionAffinityTransientAuthIDsFromContext(ctx context.Context) map[string]
 	return authIDs
 }
 
+type sessionAffinityFailoverAuthIDsKey struct{}
+
+// sessionAffinityFailoverAuthIDsMetadataKey stores the set of auth IDs tried
+// during a failover sweep in Options.Metadata so OnResult can detect when a
+// successful failover should commit a new binding.
+const sessionAffinityFailoverAuthIDsMetadataKey = "session_affinity_failover_auth_ids"
+
+// withSessionAffinityFailoverAuthIDs attaches the set of auth IDs that have been
+// tried in the current request to the context. During failover sweeps the
+// selector uses this to preserve the original binding instead of rebinding to
+// each credential as it is tried.
+func withSessionAffinityFailoverAuthIDs(ctx context.Context, authIDs map[string]struct{}) context.Context {
+	if len(authIDs) == 0 {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, sessionAffinityFailoverAuthIDsKey{}, authIDs)
+}
+
+func sessionAffinityFailoverAuthIDsFromContext(ctx context.Context) map[string]struct{} {
+	if ctx == nil {
+		return nil
+	}
+	authIDs, _ := ctx.Value(sessionAffinityFailoverAuthIDsKey{}).(map[string]struct{})
+	return authIDs
+}
+
 func shouldRebindSessionAffinityOnError(err *Error) bool {
 	if err == nil || shouldSkipCredentialCooldown(err) {
 		return false
@@ -1095,8 +1124,16 @@ func (s *SessionAffinitySelector) shouldPreserveBindingWhenUnavailable(ctx conte
 	if ctx != nil {
 		if validated, _ := ctx.Value(prevalidatedAuthCandidatesKey{}).(bool); validated {
 			transientAuthIDs := sessionAffinityTransientAuthIDsFromContext(ctx)
-			_, ok := transientAuthIDs[authID]
-			return ok
+			if _, ok := transientAuthIDs[authID]; ok {
+				return true
+			}
+			// If the auth was already tried in this request (failover sweep),
+			// preserve the binding so it doesn't drift to the last-tried credential.
+			failoverAuthIDs := sessionAffinityFailoverAuthIDsFromContext(ctx)
+			if _, ok := failoverAuthIDs[authID]; ok {
+				return true
+			}
+			return false
 		}
 	}
 	for _, candidate := range candidates {
@@ -1908,9 +1945,28 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 		fallbackKey = ns + "::" + fallbackID + "::" + nsModel
 	}
 	if res.Success {
-		s.cache.Touch(cacheKey, res.AuthID)
-		if fallbackKey != "" {
-			s.cache.Touch(fallbackKey, res.AuthID)
+		// Check if this is a failover success: the original bound auth was
+		// tried and failed, so we should commit the new auth as the binding.
+		// The failover auth IDs are passed through metadata by the conductor.
+		var failoverAuthIDs map[string]struct{}
+		if res.Options.Metadata != nil {
+			failoverAuthIDs, _ = res.Options.Metadata[sessionAffinityFailoverAuthIDsMetadataKey].(map[string]struct{})
+		}
+		currentBinding, hasCurrent := s.cache.Get(cacheKey)
+		isFailoverSuccess := hasCurrent && currentBinding != res.AuthID && len(failoverAuthIDs) > 0
+		if _, originalWasTried := failoverAuthIDs[currentBinding]; isFailoverSuccess && originalWasTried {
+			// The original binding was tried and failed, commit the new auth.
+			if fallbackKey != "" {
+				s.cache.SetAliases(res.AuthID, cacheKey, fallbackKey)
+			} else {
+				s.cache.Set(cacheKey, res.AuthID)
+			}
+		} else {
+			// Normal case: just refresh if it matches.
+			s.cache.Touch(cacheKey, res.AuthID)
+			if fallbackKey != "" {
+				s.cache.Touch(fallbackKey, res.AuthID)
+			}
 		}
 		return
 	}

@@ -1904,6 +1904,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
 		selectorCtx = withSessionAffinityTransientAuthIDs(selectorCtx, transientAuthIDs)
 		selectorCtx = withPlanExhaustedAuthIDs(selectorCtx, planExhaustedAuthIDs)
+		selectorCtx = withSessionAffinityFailoverAuthIDs(selectorCtx, tried)
 		selected, errPick = selector.Pick(selectorCtx, provider, selectionArgForSelector(selector, model), opts, selectorAuths)
 		if errPick != nil {
 			if isBuiltInSelector(selector) {
@@ -2252,6 +2253,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
 		selectorCtx = withSessionAffinityTransientAuthIDs(selectorCtx, transientAuthIDs)
 		selectorCtx = withPlanExhaustedAuthIDs(selectorCtx, planExhaustedAuthIDs)
+		selectorCtx = withSessionAffinityFailoverAuthIDs(selectorCtx, tried)
 		selected, errPick = selector.Pick(selectorCtx, "mixed", selectionArgForSelector(selector, model), opts, selectorAuths)
 		if errPick != nil {
 			if isBuiltInSelector(selector) {

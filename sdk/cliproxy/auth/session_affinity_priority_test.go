@@ -712,7 +712,9 @@ func TestManagerExecuteAndStreamRebindOnQuotaEndToEnd(t *testing.T) {
 				t.Fatalf("transient cascade Execute = %q (err=%v), want %q", string(resp.Payload), errExec, lowID)
 			}
 
-			// 3. Clear transient errors and expire cooldowns -> next ExecuteStream returns to highID.
+			// 3. Clear transient errors and expire cooldowns.
+			// With sticky failover binding, the session stays bound to lowID (the auth that
+			// succeeded during failover), not returning to highID.
 			failAuthErr = nil
 			if !disableCooling {
 				expireSessionAffinityPriorityModelCooldown(t, manager, highID, model)
@@ -723,26 +725,27 @@ func TestManagerExecuteAndStreamRebindOnQuotaEndToEnd(t *testing.T) {
 				t.Fatalf("ExecuteStream after transient recovery error = %v", errStream)
 			}
 			chunk := <-streamRes.Chunks
-			if string(chunk.Payload) != highID {
-				t.Fatalf("ExecuteStream after transient recovery = %q, want %q", string(chunk.Payload), highID)
+			if string(chunk.Payload) != lowID {
+				t.Fatalf("ExecuteStream after transient recovery = %q, want %q (sticky binding)", string(chunk.Payload), lowID)
 			}
 
-			// 4. Transient error on highID during ExecuteStream -> fails over to midID, then returns to highID.
+			// 4. Transient error on lowID during ExecuteStream -> fails over to highID (highest available).
 			failAuthErr = map[string]error{
-				highID: &Error{Code: ErrorCodeForceCooldown, Message: "stream completed without any response data"},
+				lowID: &Error{Code: ErrorCodeForceCooldown, Message: "stream completed without any response data"},
 			}
 			streamRes, errStream = manager.ExecuteStream(ctx, []string{provider}, req, opts)
 			if errStream != nil {
 				t.Fatalf("ExecuteStream transient failover error = %v", errStream)
 			}
 			chunk = <-streamRes.Chunks
-			if string(chunk.Payload) != midID {
-				t.Fatalf("ExecuteStream transient failover = %q, want %q", string(chunk.Payload), midID)
+			if string(chunk.Payload) != highID {
+				t.Fatalf("ExecuteStream transient failover = %q, want %q", string(chunk.Payload), highID)
 			}
 
 			// ErrorCodeForceCooldown always schedules a transient cooldown even when disableCooling is true.
+			// After highID succeeds, binding moves to highID.
 			failAuthErr = nil
-			expireSessionAffinityPriorityModelCooldown(t, manager, highID, model)
+			expireSessionAffinityPriorityModelCooldown(t, manager, lowID, model)
 			resp, errExec = manager.Execute(ctx, []string{provider}, req, opts)
 			if errExec != nil || string(resp.Payload) != highID {
 				t.Fatalf("Execute after stream transient recovery = %q (err=%v), want %q", string(resp.Payload), errExec, highID)

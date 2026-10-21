@@ -1266,6 +1266,8 @@ func withAttemptedAuthTracker(opts cliproxyexecutor.Options, attempted map[strin
 			prevCallback(authID)
 		}
 	}
+	// Store the attempted map so OnResult can detect failover success.
+	meta[sessionAffinityFailoverAuthIDsMetadataKey] = attempted
 	opts.Metadata = meta
 	return opts
 }
