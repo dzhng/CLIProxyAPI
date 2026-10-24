@@ -711,6 +711,22 @@ func (s *WeightedRoundRobinSelector) Pick(ctx context.Context, provider, model s
 // transient subsets produced by retry exclusions and cooldowns are never pruned.
 const maxSmoothWeightedStateEntries = 1024
 
+// syncWeights records the current weight vector without clearing accumulated
+// credits. Plan-reset weights drift as deadlines approach; wiping credits on
+// every small change would collapse the rotation onto the soonest reset.
+func (s *smoothWeightedState) syncWeights(weights map[string]int64) {
+	if s.current == nil {
+		s.current = make(map[string]int64, len(weights))
+	}
+	if s.weights == nil {
+		s.weights = make(map[string]int64, len(weights))
+	}
+	for authID, weight := range weights {
+		s.weights[authID] = weight
+	}
+	s.pruneStale(weights)
+}
+
 // prepare syncs the configured weights into the state without discarding accumulated
 // credits. Credits are reset only when a credential's configured weight actually changes,
 // never when the candidate set shrinks temporarily (retry exclusions, cooldowns, session
@@ -776,12 +792,28 @@ func authWeightVector(auths []*Auth) map[string]int64 {
 }
 
 func pickSmoothWeightedAuth(auths []*Auth, current map[string]int64) *Auth {
+	weights := make(map[string]int64, len(auths))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		if weight := authWeight(auth); weight > 0 {
+			weights[auth.ID] = weight
+		}
+	}
+	return pickSmoothWeightedByWeight(auths, current, weights)
+}
+
+func pickSmoothWeightedByWeight(auths []*Auth, current map[string]int64, weights map[string]int64) *Auth {
 	var picked *Auth
 	var pickedCurrent int64
 	var totalWeight int64
 	for _, auth := range auths {
-		weight := authWeight(auth)
-		if auth == nil || weight <= 0 {
+		if auth == nil {
+			continue
+		}
+		weight := weights[auth.ID]
+		if weight <= 0 {
 			continue
 		}
 		current[auth.ID] = saturatingAddInt64(current[auth.ID], weight)
@@ -915,6 +947,9 @@ type SessionAffinitySelector struct {
 	matcher           *cliproxysession.MerklePrefixMatcher
 	subagentAffinity  bool
 	rebindOnQuotaOnly bool
+	planResetMu       sync.Mutex
+	planResetStates   map[string]*smoothWeightedState
+	planResetLogSigs  map[string]string
 }
 
 const (
@@ -1021,6 +1056,38 @@ func isStateBlockedByQuotaOrAuth(unavailable bool, quota QuotaState, nextRetryAf
 	return nextRetryAfter.IsZero() && quota.NextRecoverAt.IsZero()
 }
 
+// shouldPreserveBindingWithPlanQuota layers the fork's plan-quota-first rule on top of upstream's
+// rebind-on=quota behaviour: a transiently unavailable binding is kept, unless the bound auth has
+// exhausted its plan window while other routable auths still have plan quota. In that case the
+// session is rebound so it moves off the exhausted (credits-only) login.
+func (s *SessionAffinitySelector) shouldPreserveBindingWithPlanQuota(ctx context.Context, provider string, candidates, routingAuths []*Auth, model, authID string, now time.Time) bool {
+	if !s.shouldPreserveBindingWhenUnavailable(ctx, candidates, model, authID, now) {
+		return false
+	}
+	var bound *Auth
+	for _, candidate := range candidates {
+		if candidate != nil && candidate.ID == authID {
+			bound = candidate
+			break
+		}
+	}
+	// On the Manager path the bound auth is usually absent from candidates (it is cooling
+	// down), so fall back to the plan-exhausted set the Manager recorded under its lock.
+	boundExhausted := bound != nil && authPlanWindowExhausted(provider, bound)
+	if bound == nil {
+		_, boundExhausted = planExhaustedAuthIDsFromContext(ctx)[authID]
+	}
+	if !boundExhausted {
+		return true
+	}
+	for _, candidate := range routingAuths {
+		if candidate != nil && candidate.ID != authID && !authPlanWindowExhausted(provider, candidate) {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *SessionAffinitySelector) shouldPreserveBindingWhenUnavailable(ctx context.Context, candidates []*Auth, model, authID string, now time.Time) bool {
 	if s == nil || !s.rebindOnQuotaOnly || authID == "" {
 		return false
@@ -1090,9 +1157,16 @@ func (s *SessionAffinitySelector) Trees() *cliproxysession.InMemorySessionTreeSt
 // matcher before retaining the legacy derived/hash fallback behavior.
 //
 // An established binding outranks credential priority: a bound credential that is still
-// available is reused even when a higher-priority credential recovers. Credential priority
-// applies to cold bindings, requests without a session, and genuine bound-credential
-// failover, so the fallback selector only ever receives the highest available priority tier.
+// available is reused even when a higher-priority credential recovers, and a plan-quota
+// binding is not moved just because another plan-quota credential exists. A bound
+// credential whose stored included-plan window is exhausted is treated as unavailable
+// when any other available credential still has plan quota, and is rebound inside that
+// quota subset. New sessions and rebinds inside the quota subset use reset-weighted
+// round-robin (sooner plan reset, higher weight, times the Codex/Claude manual-reset boost),
+// with no special case after idle periods. When every credential is plan-exhausted the
+// configured fallback selector still runs on the full set. Credentials with no usage
+// snapshot are not treated as plan-exhausted. Credential priority still applies inside
+// the quota subset.
 //
 // Note: The cache key includes provider, session ID, and model to handle cases where
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
@@ -1146,12 +1220,12 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		availabilityCandidates = positiveWeightAuths(auths)
 	}
 	if primaryID == "" {
-		fallbackAuths, errAvailable := getSelectorAvailableAuths(ctx, availabilityCandidates, provider, model, now)
+		availableNow, errAvailable := getSelectorAvailableAuthsAcrossPriorities(ctx, availabilityCandidates, provider, model, now)
 		if errAvailable != nil {
 			return nil, errAvailable
 		}
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		return s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+		return s.pickPlanQuota(ctx, provider, model, opts, availableNow)
 	}
 
 	// A single availability pass serves both lookups: the bound credential is validated against
@@ -1160,7 +1234,8 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if err != nil {
 		return nil, err
 	}
-	fallbackAuths := highestPriorityAuths(available)
+	routingAuths := planQuotaRoutingAuths(provider, available)
+	stickyQuotaOK := authIDSet(routingAuths)
 
 	modelKey := canonicalModelKey(model)
 	cacheKey := provider + "::" + primaryID + "::" + modelKey
@@ -1198,21 +1273,21 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
 		for _, auth := range available {
-			if auth.ID == cachedAuthID {
+			if auth != nil && auth.ID == cachedAuthID && stickyQuotaOK[auth.ID] {
 				bind(auth.ID, true)
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
 			}
 		}
-		// Cached auth not available, reselect via fallback selector for even distribution
-		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+		// Cached auth not available or plan-exhausted; rebind inside the quota set.
+		auth, err := s.pickPlanQuota(ctx, provider, model, opts, available)
 		if err != nil {
 			return nil, err
 		}
 		if auth == nil {
 			return nil, nil
 		}
-		if s.shouldPreserveBindingWhenUnavailable(ctx, availabilityCandidates, model, cachedAuthID, now) {
+		if s.shouldPreserveBindingWithPlanQuota(ctx, provider, availabilityCandidates, routingAuths, model, cachedAuthID, now) {
 			bind(cachedAuthID, false)
 			entry.Infof("session-affinity: cache hit but auth transiently unavailable, failover without rebinding | session=%s bound_auth=%s failover_auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, auth.ID, provider, model)
 			return auth, nil
@@ -1236,7 +1311,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 		if parentAuthID := s.cache.latestSessionAuth(fallbackID, providers); parentAuthID != "" {
 			for _, auth := range available {
-				if auth.ID == parentAuthID {
+				if auth != nil && auth.ID == parentAuthID && stickyQuotaOK[auth.ID] {
 					bind(auth.ID, true)
 					entry.Infof("session-affinity: guardian inherited parent binding | session=%s parent=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 					return auth, nil
@@ -1248,7 +1323,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if fallbackKey != "" {
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
 			for _, auth := range available {
-				if auth.ID == cachedAuthID {
+				if auth != nil && auth.ID == cachedAuthID && stickyQuotaOK[auth.ID] {
 					if !isSubagent || s.subagentAffinity {
 						bind(auth.ID, true)
 						if isFork {
@@ -1260,8 +1335,8 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 					}
 				}
 			}
-			if !isSubagent && !isFork && s.shouldPreserveBindingWhenUnavailable(ctx, availabilityCandidates, model, cachedAuthID, now) {
-				auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+			if !isSubagent && !isFork && s.shouldPreserveBindingWithPlanQuota(ctx, provider, availabilityCandidates, routingAuths, model, cachedAuthID, now) {
+				auth, err := s.pickPlanQuota(ctx, provider, model, opts, available)
 				if err != nil {
 					return nil, err
 				}
@@ -1275,7 +1350,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+	auth, err := s.pickPlanQuota(ctx, provider, model, opts, available)
 	if err != nil {
 		return nil, err
 	}
@@ -1323,11 +1398,13 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 	if errAvailable != nil {
 		return nil, true, errAvailable
 	}
+	routingAuths := planQuotaRoutingAuths(provider, available)
+	stickyQuotaOK := authIDSet(routingAuths)
 
 	var preservedAuthID string
 	if match, ok := s.matcher.MatchFingerprintsWithContext(namespace, fingerprints, tailFingerprints, envDigest, minPrefixLength); ok {
 		for _, auth := range available {
-			if auth == nil || auth.ID != match.AuthID {
+			if auth == nil || auth.ID != match.AuthID || !stickyQuotaOK[auth.ID] {
 				continue
 			}
 			if match.SessionID != "" {
@@ -1366,13 +1443,12 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 			}
 			return auth, true, nil
 		}
-		if !match.IsFork && s.shouldPreserveBindingWhenUnavailable(ctx, availabilityCandidates, model, match.AuthID, now) {
+		if !match.IsFork && s.shouldPreserveBindingWithPlanQuota(ctx, provider, availabilityCandidates, routingAuths, model, match.AuthID, now) {
 			preservedAuthID = match.AuthID
 		}
 	}
 
-	fallbackAuths := highestPriorityAuths(available)
-	auth, errPick := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+	auth, errPick := s.pickPlanQuota(ctx, provider, model, opts, available)
 	if errPick != nil {
 		return nil, true, errPick
 	}
@@ -1431,6 +1507,113 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 		}
 	}
 	return auth, true, nil
+}
+
+// pickPlanQuota selects inside the plan-quota subset. New sessions and rebinds
+// always use reset-weighted round-robin (with the manual-reset boost), whether
+// or not the proxy has been idle. A fully plan-exhausted set keeps the
+// configured fallback selector.
+func (s *SessionAffinitySelector) pickPlanQuota(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, available []*Auth) (*Auth, error) {
+	if !planResetRoutingActive(provider, available) || !builtInRoutingSelector(s.fallback) {
+		return s.fallback.Pick(ctx, provider, model, opts, highestPriorityAuths(planQuotaRoutingAuths(provider, available)))
+	}
+	candidates := highestPriorityAuths(planQuotaRoutingAuths(provider, available))
+	return s.pickPlanResetWeighted(provider, model, candidates)
+}
+
+func builtInRoutingSelector(selector Selector) bool {
+	switch selector.(type) {
+	case *RoundRobinSelector, *FillFirstSelector, *WeightedRoundRobinSelector:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *SessionAffinitySelector) pickPlanResetWeighted(provider, model string, auths []*Auth) (*Auth, error) {
+	if len(auths) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
+	}
+	now := time.Now()
+	weights := make(map[string]int64, len(auths))
+	for _, candidate := range auths {
+		if candidate == nil || candidate.ID == "" {
+			continue
+		}
+		weights[candidate.ID] = planResetRoutingWeight(provider, candidate, now)
+	}
+	boosted := applyManualResetPriority(provider, auths, weights, now, currentManualResetSettings())
+	key := provider + ":" + canonicalModelKey(model)
+
+	s.planResetMu.Lock()
+	defer s.planResetMu.Unlock()
+	if s.planResetStates == nil {
+		s.planResetStates = make(map[string]*smoothWeightedState)
+	}
+	if _, ok := s.planResetStates[key]; !ok && len(s.planResetStates) >= 4096 {
+		s.planResetStates = make(map[string]*smoothWeightedState)
+	}
+	state := s.planResetStates[key]
+	if state == nil {
+		state = &smoothWeightedState{}
+		s.planResetStates[key] = state
+	}
+	s.logPlanResetWeightsLocked(provider, key, auths, weights, boosted, now)
+	state.syncWeights(weights)
+	picked := pickSmoothWeightedByWeight(auths, state.current, weights)
+	if picked == nil {
+		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+	}
+	return picked, nil
+}
+
+// logPlanResetWeightsLocked logs the Codex or Claude plan-reset weight table whenever it
+// changes for a provider/model key. Labels are short file ids; emails and
+// tokens are never logged. Callers must hold planResetMu.
+func (s *SessionAffinitySelector) logPlanResetWeightsLocked(provider, key string, auths []*Auth, weights map[string]int64, boosted map[string]bool, now time.Time) {
+	if s == nil || len(auths) == 0 {
+		return
+	}
+	parts := make([]string, 0, len(auths))
+	logged := false
+	for _, candidate := range auths {
+		if candidate == nil || candidate.ID == "" {
+			continue
+		}
+		kind := planQuotaProviderKind(provider, candidate)
+		if kind == manualResetKindCodex || kind == manualResetKindClaude {
+			logged = true
+		}
+		weekly := "-"
+		if reset, ok := manualResetWeeklyReset(kind, candidate, now); ok {
+			weekly = reset.Local().Format("01/02 15:04")
+		}
+		manual := "-"
+		if expiry, count, ok := earliestManualReset(kind, candidate.ID, now); ok {
+			manual = fmt.Sprintf("%s(n=%d)", expiry.Local().Format("01/02 15:04"), count)
+		}
+		mark := ""
+		if boosted[candidate.ID] {
+			mark = "*"
+		}
+		parts = append(parts, fmt.Sprintf("%s weekly=%s manual=%s weight=%d%s", ShortAuthLabel(candidate), weekly, manual, weights[candidate.ID], mark))
+	}
+	if !logged {
+		return
+	}
+	sort.Strings(parts)
+	sig := strings.Join(parts, "; ")
+	if s.planResetLogSigs == nil {
+		s.planResetLogSigs = make(map[string]string)
+	}
+	if s.planResetLogSigs[key] == sig {
+		return
+	}
+	if len(s.planResetLogSigs) >= 4096 {
+		s.planResetLogSigs = make(map[string]string)
+	}
+	s.planResetLogSigs[key] = sig
+	log.Infof("plan-quota routing weights | key=%s | %s", key, sig)
 }
 
 func canonicalLCPProvider(provider string) string {
