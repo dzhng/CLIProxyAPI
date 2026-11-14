@@ -269,10 +269,17 @@ func newAuthUnavailableErrorWithCause(next, now time.Time, cause error) error {
 	if next.After(now) {
 		err.HTTPStatus = http.StatusServiceUnavailable
 		err.Retryable = true
+		retryAfter := next.Sub(now)
+		// Preserve an explicit provider retry hint when the scheduler's
+		// aggregate cooldown is longer. The provider's Retry-After is the
+		// client-visible contract for this failed request.
+		if hint := retryAfterFromError(cause); hint != nil && *hint > 0 && *hint < retryAfter {
+			retryAfter = *hint
+		}
 		return &authUnavailableError{
 			cause:      cause,
 			base:       err,
-			retryAfter: next.Sub(now),
+			retryAfter: retryAfter,
 		}
 	}
 	if cause != nil {

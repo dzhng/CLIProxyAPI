@@ -3155,6 +3155,14 @@ func (m *Manager) annotatePoolCooldownTerminalErrorAt(ctx context.Context, provi
 	if !ok {
 		return lastErr
 	}
+	var pluginRetryAfter interface{ IsPluginError() bool }
+	if errors.As(lastErr, &pluginRetryAfter) && pluginRetryAfter != nil && pluginRetryAfter.IsPluginError() {
+		if hint := retryAfterFromError(lastErr); hint != nil && *hint > 0 {
+			if remaining := deadline.Sub(now); *hint < remaining {
+				deadline = now.Add(*hint)
+			}
+		}
+	}
 	return &poolCooldownTerminalError{cause: lastErr, deadline: deadline}
 }
 

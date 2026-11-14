@@ -80,6 +80,10 @@ func (e rpcError) IsTransientRateLimit() bool {
 	return !e.IsCredentialScoped() && strings.EqualFold(strings.TrimSpace(e.Code), pluginabi.ErrorCodeTransientRateLimit)
 }
 
+// IsPluginError marks retry hints that originated from a plugin transport. The
+// auth manager may preserve these hints when wrapping pool cooldown errors.
+func (e rpcError) IsPluginError() bool { return true }
+
 func (e rpcError) IsStreamTruncated() bool {
 	return !e.IsCredentialScoped() && strings.EqualFold(strings.TrimSpace(e.Code), pluginabi.ErrorCodeStreamTruncated)
 }

@@ -129,6 +129,9 @@ func newModelCooldownErrorForCandidates(model, provider string, resetIn time.Dur
 	if resetIn < 0 {
 		resetIn = 0
 	}
+	if hint := retryAfterFromError(cause); hint != nil && *hint > 0 && *hint < resetIn {
+		resetIn = *hint
+	}
 	return &modelCooldownError{
 		model:          model,
 		provider:       provider,
