@@ -1,11 +1,12 @@
 package auth
 
 import (
-	"encoding/json"
 	"math"
-	"regexp"
 	"sort"
 	"time"
+
+	"github.com/MoeForge/moego/json"
+	"github.com/MoeForge/moego/regexp"
 )
 
 // Claude reset grants come from the "cedar_ember" block of

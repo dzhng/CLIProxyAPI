@@ -2,18 +2,19 @@ package auth
 
 import (
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/MoeForge/moego/json"
+	"github.com/MoeForge/moego/regexp"
 )
 
 // Codex Pro accounts can bank "manual resets" (rate-limit reset credits), and
